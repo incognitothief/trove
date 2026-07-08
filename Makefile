@@ -4,6 +4,9 @@
 CARGO ?= cargo
 NPM   ?= npm
 UI    := ui
+# Optional Cargo features for S3-backed bucket (e.g. `make dev CARGO_FEATURES=s3`).
+CARGO_FEATURES ?=
+CARGO_FEATURE_FLAGS := $(if $(CARGO_FEATURES),--features $(CARGO_FEATURES),)
 
 # Local, disposable state (override to isolate a demo, e.g. `make dev TROVE_HOME=/tmp/t/home`).
 export TROVE_HOME       ?= $(HOME)/.trove
@@ -41,13 +44,13 @@ build-ui: ## Type-check and build the production UI bundle
 ## --- Run services -----------------------------------------------------------
 
 server: ## Run the local HTTP/JSON daemon (trove-serverd)
-	TROVE_SERVERD_ADDR=$(SERVERD_ADDR) $(CARGO) run -p trove-serverd
+	TROVE_SERVERD_ADDR=$(SERVERD_ADDR) $(CARGO) run -p trove-serverd $(CARGO_FEATURE_FLAGS)
 
 ui: ## Run the web UI dev server (Vite), proxying /api to the daemon
 	$(NPM) --prefix $(UI) run dev
 
 dev: ## Boot the full stack (pre-builds, waits for readiness, prints addresses)
-	@SERVERD_ADDR=$(SERVERD_ADDR) bash scripts/dev.sh
+	@SERVERD_ADDR=$(SERVERD_ADDR) CARGO_FEATURES='$(CARGO_FEATURES)' bash scripts/dev.sh
 
 # Forward everything after `cli` to the CLI. Because make itself parses leading
 # dashes as its own options, put a `--` before any CLI flags, e.g.
