@@ -2,7 +2,6 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-07
-- **Deciders:** Trove maintainers
 - **Supersedes:** —
 - **Superseded by:** —
 
@@ -33,12 +32,12 @@ We adopt the following foundational architecture.
 
 Four distinct roles, each with a single responsibility:
 
-| Concept          | Role                             |
-| ---------------- | -------------------------------- |
-| Bucket storage   | Durable archive (source of truth)|
-| Local drive      | Disposable performance cache     |
-| Local index DB   | Rebuildable search surface       |
-| Sync state       | Resumable transfer bookkeeping   |
+| Concept        | Role                              |
+| -------------- | --------------------------------- |
+| Bucket storage | Durable archive (source of truth) |
+| Local drive    | Disposable performance cache      |
+| Local index DB | Rebuildable search surface        |
+| Sync state     | Resumable transfer bookkeeping    |
 
 Stated as a separation of indexes:
 
@@ -271,7 +270,7 @@ in" imports: it seeds the entire archive from an existing 100–500 GB local
 library. We treat it as a **resumable bulk migration**, not a normal upload.
 
 The guiding rule is: **never make success implicit.** Every file carries an
-explicit state, and the canonical archive index only advances *after* files are
+explicit state, and the canonical archive index only advances _after_ files are
 uploaded and verified. Commit is always the last step.
 
 #### Phases

@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/trove-core",
+    "crates/trove-cli",
+    "crates/trove-serverd",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/trove/trove"
+authors = ["Trove maintainers"]
+
+# Shared dependency versions. Individual crates opt in via `workspace = true`.
+[workspace.dependencies]
+trove-core = { path = "crates/trove-core" }
+
+# Errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Storage / hashing / ids
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async / HTTP (serverd)
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+[profile.release]
+lto = "thin"

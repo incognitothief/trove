@@ -1,0 +1,33 @@
+# Example Trove configuration.
+# Copy to ~/.trove/config.toml and adjust. See ADR 000 (docs/adr/000-bootstrap.md).
+
+# Canonical durable archive (the only source of truth).
+[bucket]
+name = "your-bucket"
+region = "us-east-1"
+# Optional custom endpoint (e.g. for S3-compatible stores like MinIO/R2).
+# endpoint = "https://s3.example.com"
+# Prefix under which Trove keeps its index + audio objects.
+prefix = ".trove"
+music_prefix = "music"
+
+# Where local audio ends up by default when not targeting a volume.
+[local]
+music_folder = "~/Music/Trove"
+
+# Default export behavior when flashing a volume.
+[export]
+# Layout of files written onto a performance volume.
+#   "artist-album" -> Music/Artist/Album/Track.flac
+#   "flat"         -> Music/Track.flac
+layout = "artist-album"
+playlist_format = "m3u8"
+
+# Mixxx-facing playlist settings.
+[mixxx]
+relative_paths = true
+
+# Named profiles let you point at multiple buckets/regions.
+# [profiles.touring]
+# bucket = "touring-archive"
+# region = "eu-west-1"
