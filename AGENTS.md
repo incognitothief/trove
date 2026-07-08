@@ -55,7 +55,7 @@ make deps     # install Rust + UI deps
 make build    # cargo build --workspace
 make test     # cargo test --workspace
 make lint     # cargo clippy --workspace --all-targets
-make dev      # daemon + UI together
+make dev      # boot daemon + UI via scripts/dev.sh (waits for readiness, prints addresses)
 make cli ARGS="query --limit 20"
 ```
 

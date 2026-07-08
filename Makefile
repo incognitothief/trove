@@ -46,9 +46,8 @@ server: ## Run the local HTTP/JSON daemon (trove-serverd)
 ui: ## Run the web UI dev server (Vite), proxying /api to the daemon
 	$(NPM) --prefix $(UI) run dev
 
-dev: ## Run the daemon and the UI together (Ctrl-C stops both)
-	@echo "Starting trove-serverd ($(SERVERD_ADDR)) + UI (http://localhost:5273)"
-	@$(MAKE) -j2 server ui
+dev: ## Boot the full stack (pre-builds, waits for readiness, prints addresses)
+	@SERVERD_ADDR=$(SERVERD_ADDR) bash scripts/dev.sh
 
 cli: ## Run the CLI; pass args with ARGS, e.g. `make cli ARGS="query --limit 20"`
 	$(CARGO) run -p trove-cli -- $(ARGS)

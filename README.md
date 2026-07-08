@@ -31,6 +31,7 @@ trove/
 ├── ui/                  # React web UI (thin client over trove-serverd)
 ├── docs/adr/            # architecture decision records
 ├── config.example.toml  # sample local config (copy to ~/.trove/config.toml)
+├── scripts/             # dev/boot scripts (e.g. scripts/dev.sh)
 └── Makefile             # developer task shortcuts
 ```
 
@@ -60,7 +61,7 @@ Run `make` (or `make help`) to list every task. Common ones:
 | `make build`      | Build core + CLI + daemon                           |
 | `make server`     | Run `trove-serverd` (default `127.0.0.1:7377`)      |
 | `make ui`         | Run the Vite dev server (proxies `/api` → daemon)   |
-| `make dev`        | Run the daemon and UI concurrently                  |
+| `make dev`        | Boot the stack via `scripts/dev.sh` (waits + banner)|
 | `make cli ARGS=…` | Run the CLI, e.g. `make cli ARGS="query --limit 20"`|
 | `make test`       | Run the Rust test suite                             |
 | `make lint`       | `cargo clippy --workspace --all-targets`            |
