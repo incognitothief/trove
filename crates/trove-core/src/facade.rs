@@ -145,7 +145,12 @@ impl Trove {
 
     /// Plan a bulk import (scan + hash + dedupe + gather art). Dry-run friendly.
     pub fn import_plan(&self, source_root: &Path, options: &ImportOptions) -> Result<ImportJob> {
-        import::plan(source_root, import::DEFAULT_AUDIO_EXTENSIONS, options)
+        import::plan(
+            source_root,
+            import::DEFAULT_AUDIO_EXTENSIONS,
+            options,
+            Some(&self.archive),
+        )
     }
 
     /// Run a planned import to completion: upload → verify → commit, capture any
@@ -157,6 +162,7 @@ impl Trove {
             job,
             self.store.as_ref(),
             &self.paths,
+            &self.archive,
             self.extractor.as_ref(),
         )?;
         for entry in &committed {

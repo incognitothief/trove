@@ -46,6 +46,7 @@ mod tests {
     use super::*;
     use crate::archive::index::{self, BucketPaths};
     use crate::archive::reconcile::ReconcileReport;
+    use crate::import::FileState;
     use crate::model::SchemaVersion;
     use crate::store::{stub::StubStore, ObjectStore};
     use chrono::Utc;
@@ -167,6 +168,7 @@ mod tests {
             dir.path(),
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
             &ImportOptions::default(),
+            None,
         )
         .unwrap();
         assert_eq!(job.files.len(), 1, "only the real audio track is imported");
@@ -190,9 +192,52 @@ mod tests {
                 include_dotfiles: false,
                 capture_artwork: false,
             },
+            None,
         )
         .unwrap();
         assert!(no_art.artwork.is_empty());
+    }
+
+    #[test]
+    fn import_commits_content_addressed_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("01 - track.mp3"), b"audio-bytes").unwrap();
+
+        let mut trove = Trove::in_memory(test_config()).unwrap();
+        let mut job = trove
+            .import_plan(dir.path(), &ImportOptions::default())
+            .unwrap();
+        let sha = job.files[0].sha256.clone();
+        let committed = trove.import_run(&mut job).unwrap();
+        assert_eq!(committed, 1);
+
+        let results = trove.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].object_key, format!("music/{sha}.mp3"));
+        assert_eq!(results[0].sha256, sha);
+    }
+
+    #[test]
+    fn import_skips_archive_duplicate_sha() {
+        let dir1 = tempfile::tempdir().unwrap();
+        std::fs::write(dir1.path().join("first.mp3"), b"same-bytes").unwrap();
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::write(dir2.path().join("second.mp3"), b"same-bytes").unwrap();
+
+        let mut trove = Trove::in_memory(test_config()).unwrap();
+        let mut first = trove
+            .import_plan(dir1.path(), &ImportOptions::default())
+            .unwrap();
+        assert_eq!(trove.import_run(&mut first).unwrap(), 1);
+
+        let mut second = trove
+            .import_plan(dir2.path(), &ImportOptions::default())
+            .unwrap();
+        assert_eq!(second.files.len(), 1);
+        assert_eq!(second.files[0].state, FileState::Duplicate);
+        assert_eq!(trove.import_run(&mut second).unwrap(), 0);
+        assert_eq!(trove.query(&QuerySpec::new(), false).unwrap().len(), 1);
     }
 
     #[test]

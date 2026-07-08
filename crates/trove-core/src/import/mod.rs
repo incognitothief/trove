@@ -5,6 +5,7 @@
 //! abstraction (so it runs end-to-end against the stub store): scan and hash on
 //! disk, dedupe by content hash, upload to a per-job staging prefix, verify,
 //! then commit into the canonical `music/` namespace and the archive index.
+//! Canonical audio keys are content-addressed (`music/<sha256>.<ext>`, ADR 004).
 //! Wiring to persistent `import_files` bookkeeping and multipart uploads is the
 //! next step; the state machine and object layout are already in place.
 
@@ -17,6 +18,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::archive::index::BucketPaths;
+use crate::db::archive::ArchiveDb;
 use crate::error::Result;
 use crate::metadata::MetadataExtractor;
 use crate::model::{ArchiveEntry, ArtworkRecord, TrackId};
@@ -108,7 +110,12 @@ pub struct ImportStats {
 /// content hash, and (per options) gather co-located cover art. Produces a job
 /// with per-file state populated up to `hashed` (or `duplicate`). This is the
 /// dry-run-friendly phase.
-pub fn plan(source_root: &Path, extensions: &[&str], options: &ImportOptions) -> Result<ImportJob> {
+pub fn plan(
+    source_root: &Path,
+    extensions: &[&str],
+    options: &ImportOptions,
+    archive: Option<&ArchiveDb>,
+) -> Result<ImportJob> {
     let id = Uuid::new_v4().to_string();
     let mut files = Vec::new();
     let mut seen_hashes = std::collections::HashSet::new();
@@ -126,10 +133,14 @@ pub fn plan(source_root: &Path, extensions: &[&str], options: &ImportOptions) ->
         let bytes = std::fs::read(path)?;
         let size = bytes.len() as u64;
         let sha256 = hash_bytes(&bytes);
-        let state = if seen_hashes.insert(sha256.clone()) {
-            FileState::Hashed
-        } else {
+        let already_in_archive = match archive {
+            Some(db) => db.find_by_sha256(&sha256)?.is_some(),
+            None => false,
+        };
+        let state = if !seen_hashes.insert(sha256.clone()) || already_in_archive {
             FileState::Duplicate
+        } else {
+            FileState::Hashed
         };
         files.push(PlannedFile {
             path: path.clone(),
@@ -282,6 +293,7 @@ pub fn commit(
     job: &mut ImportJob,
     store: &dyn ObjectStore,
     paths: &BucketPaths,
+    archive: &ArchiveDb,
     extractor: &dyn MetadataExtractor,
 ) -> Result<Vec<ArchiveEntry>> {
     let mut committed = Vec::new();
@@ -289,14 +301,24 @@ pub fn commit(
         if file.state != FileState::Verified {
             continue;
         }
+
+        if let Some(existing) = archive.find_by_sha256(&file.sha256)? {
+            file.object_key = Some(existing.object_key.clone());
+            file.track_id = Some(existing.track_id.clone());
+            file.state = FileState::Duplicate;
+            continue;
+        }
+
         let staging_key = file
             .object_key
             .as_ref()
             .expect("verified file must have an object key")
             .clone();
-        let rel = music_relative(&file.path);
+        let rel = canonical_music_relative(&file.sha256, &file.path);
         let music_key = paths.music(&rel);
-        store.copy(&staging_key, &music_key)?;
+        if !store.exists(&music_key)? {
+            store.copy(&staging_key, &music_key)?;
+        }
 
         let track_id = TrackId::new();
         let now = Utc::now();
@@ -386,12 +408,14 @@ fn staging_relative(sha256: &str, path: &Path) -> String {
     format!("{sha256}/{name}")
 }
 
-/// Default committed layout: `Artist/Album/Track.ext`, falling back to filename.
-fn music_relative(path: &Path) -> String {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("track")
-        .to_string()
+/// Canonical committed layout: `<sha256>.<ext>` under `music/` (ADR 004).
+pub fn canonical_music_relative(sha256: &str, path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_else(|| "bin".to_string());
+    format!("{sha256}.{ext}")
 }
 
 /// Default audio extensions recognized by import scans (the ingest allowlist).
@@ -401,3 +425,14 @@ pub const DEFAULT_AUDIO_EXTENSIONS: &[&str] =
 /// Image extensions treated as candidate cover art when co-located with audio.
 pub const DEFAULT_IMAGE_EXTENSIONS: &[&str] =
     &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_music_relative_uses_hash_and_extension() {
+        let path = Path::new("/music/Artist/Album/01 - Intro.mp3");
+        assert_eq!(canonical_music_relative("abc123", path), "abc123.mp3");
+    }
+}
