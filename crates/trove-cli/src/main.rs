@@ -72,6 +72,12 @@ struct ImportArgs {
     /// Resume a previously interrupted job.
     #[arg(long)]
     resume: bool,
+    /// Include dotfiles / hidden directories (excluded by default).
+    #[arg(long)]
+    include_dotfiles: bool,
+    /// Do not capture co-located cover art (captured by default).
+    #[arg(long)]
+    no_artwork: bool,
 }
 
 #[derive(Args)]
@@ -183,25 +189,40 @@ fn archive(cli: &Cli, cmd: &ArchiveCmd) -> Result<()> {
 
 fn import(_cli: &Cli, args: &ImportArgs) -> Result<()> {
     let mut trove = runtime::open_trove()?;
+    // Start from configured defaults, then apply command-line overrides.
+    let options = trove_core::ImportOptions {
+        include_dotfiles: trove.config.import.include_dotfiles || args.include_dotfiles,
+        capture_artwork: trove.config.import.capture_artwork && !args.no_artwork,
+    };
+
     let source = std::path::Path::new(&args.path);
     let mut job = trove
-        .import_plan(source)
+        .import_plan(source, &options)
         .with_context(|| format!("planning import of {}", args.path))?;
     let stats = job.stats();
     println!(
-        "planned job {}: {} file(s), {} duplicate(s)",
-        job.id, stats.total, stats.duplicates
+        "planned job {}: {} file(s), {} duplicate(s), {} cover-art candidate(s)",
+        job.id,
+        stats.total,
+        stats.duplicates,
+        job.artwork.len()
     );
 
     if args.plan {
         for file in &job.files {
             println!("  {:>9}  {}", file.state.as_str(), file.path.display());
         }
+        for art in &job.artwork {
+            println!("  {:>9}  {}", "artwork", art.path.display());
+        }
         return Ok(());
     }
 
     let committed = trove.import_run(&mut job).context("running import")?;
-    println!("committed {committed} track(s) into the archive");
+    println!(
+        "committed {committed} track(s) and captured {} cover-art object(s)",
+        job.artwork.len()
+    );
     Ok(())
 }
 

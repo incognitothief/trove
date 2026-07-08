@@ -4,7 +4,7 @@
 //! [`ArchiveEntry`] per line); the SQLite form exists for fast local restore.
 
 use crate::error::Result;
-use crate::model::{ArchiveEntry, SchemaVersion};
+use crate::model::{ArchiveEntry, ArtworkRecord, SchemaVersion};
 
 /// Object key (relative to the bucket prefix) of the JSONL index.
 pub const ARCHIVE_INDEX_JSONL: &str = "archive-index.jsonl";
@@ -14,6 +14,8 @@ pub const ARCHIVE_INDEX_SQLITE: &str = "archive-index.sqlite";
 pub const SCHEMA_VERSION_JSON: &str = "schema-version.json";
 /// Object key of the playlists interchange file.
 pub const PLAYLISTS_JSONL: &str = "playlists.jsonl";
+/// Object key (under the bucket prefix) of the artwork provenance manifest.
+pub const ARTWORK_MANIFEST_JSONL: &str = "manifests/artwork.jsonl";
 
 /// Resolves fully-qualified object keys under a configured bucket prefix.
 #[derive(Debug, Clone)]
@@ -54,6 +56,14 @@ impl BucketPaths {
     pub fn music(&self, relative: &str) -> String {
         format!("{}/{}", self.music_prefix, relative.trim_start_matches('/'))
     }
+    /// Content-addressed cover-art namespace (top-level, parallel to music).
+    pub fn artwork(&self, relative: &str) -> String {
+        format!("artwork/{}", relative.trim_start_matches('/'))
+    }
+    /// The durable artwork provenance manifest key (under the bucket prefix).
+    pub fn artwork_manifest(&self) -> String {
+        self.join(ARTWORK_MANIFEST_JSONL)
+    }
 }
 
 /// Serialize entries to the JSONL interchange format.
@@ -69,6 +79,31 @@ pub fn entries_to_jsonl(entries: &[ArchiveEntry]) -> Result<Vec<u8>> {
 
 /// Parse entries from the JSONL interchange format, skipping blank lines.
 pub fn entries_from_jsonl(bytes: &[u8]) -> Result<Vec<ArchiveEntry>> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push(serde_json::from_str(line)?);
+    }
+    Ok(out)
+}
+
+/// Serialize artwork provenance records to JSONL.
+pub fn artwork_to_jsonl(records: &[ArtworkRecord]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for record in records {
+        let line = serde_json::to_string(record)?;
+        out.extend_from_slice(line.as_bytes());
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+/// Parse artwork provenance records from JSONL, skipping blank lines.
+pub fn artwork_from_jsonl(bytes: &[u8]) -> Result<Vec<ArtworkRecord>> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Vec::new();
     for line in text.lines() {

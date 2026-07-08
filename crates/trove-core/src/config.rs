@@ -22,7 +22,30 @@ pub struct Config {
     #[serde(default)]
     pub mixxx: MixxxConfig,
     #[serde(default)]
+    pub import: ImportConfig,
+    #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+}
+
+/// Import-time behavior. See ADR 002.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportConfig {
+    /// Include dotfiles / hidden directories in scans (default: exclude).
+    #[serde(default)]
+    pub include_dotfiles: bool,
+    /// Capture co-located cover art during import (default: on). This is a
+    /// durability measure — folder art exists only on the disposable source.
+    #[serde(default = "default_true")]
+    pub capture_artwork: bool,
+}
+
+impl Default for ImportConfig {
+    fn default() -> Self {
+        ImportConfig {
+            include_dotfiles: false,
+            capture_artwork: true,
+        }
+    }
 }
 
 /// Canonical archive location — the only durable source of truth.
