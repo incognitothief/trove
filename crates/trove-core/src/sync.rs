@@ -276,7 +276,7 @@ pub fn export_playlist(
         PlaylistFormat::M3u => "m3u",
     };
     let filename = format!("Playlists/{playlist_name}.{ext}");
-    let body = render_playlist(&paths, format, relative_paths);
+    let body = render_playlist(&paths, format, relative_paths, &filename);
     PlaylistExport {
         filename,
         body,
@@ -374,20 +374,46 @@ fn extension_for_entry(entry: &ArchiveEntry) -> String {
         .to_lowercase()
 }
 
-fn render_playlist(paths: &[String], format: PlaylistFormat, relative: bool) -> String {
+fn render_playlist(
+    paths: &[String],
+    format: PlaylistFormat,
+    relative: bool,
+    playlist_file: &str,
+) -> String {
     let mut lines = Vec::new();
-    if matches!(format, PlaylistFormat::M3u8) {
-        lines.push("#EXTM3U".to_string());
-    }
+    // Mixxx always writes #EXTM3U for both .m3u and .m3u8 exports.
+    lines.push("#EXTM3U".to_string());
+    let _ = format; // encoding distinction is file extension / UTF-8 on write
     for path in paths {
         let line = if relative {
-            path.clone()
+            path_relative_to_playlist(path, playlist_file)
         } else {
             format!("/{}", path.trim_start_matches('/'))
         };
+        lines.push("#EXTINF".to_string());
         lines.push(line);
     }
     lines.join("\n") + "\n"
+}
+
+/// Path from the playlist file to a volume-root-relative track location.
+fn path_relative_to_playlist(volume_relative: &str, playlist_file: &str) -> String {
+    let track = volume_relative.trim_start_matches('/');
+    let playlist_dir = Path::new(playlist_file)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if playlist_dir == Path::new(".") {
+        return track.to_string();
+    }
+    let mut ups = 0usize;
+    let mut current = playlist_dir;
+    while let Some(parent) = current.parent() {
+        ups += 1;
+        current = parent;
+    }
+    let up_prefix = "../".repeat(ups);
+    format!("{up_prefix}{track}")
 }
 
 fn download_to_volume(
@@ -497,6 +523,18 @@ mod tests {
         let path = destination_path(&entry, ExportLayout::ArtistAlbum);
         assert!(path.ends_with("Cycles.flac"));
         assert!(!path.contains("abc123"));
+    }
+
+    #[test]
+    fn playlist_paths_relative_to_playlist_file() {
+        let body = render_playlist(
+            &["Music/Artist/Album/track.mp3".to_string()],
+            PlaylistFormat::M3u8,
+            true,
+            "Playlists/tonight.m3u8",
+        );
+        assert!(body.starts_with("#EXTM3U\n"));
+        assert!(body.contains("#EXTINF\n../Music/Artist/Album/track.mp3"));
     }
 
     #[test]

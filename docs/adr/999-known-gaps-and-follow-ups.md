@@ -56,7 +56,6 @@ it.
 | Gap | Notes |
 | --- | ----- |
 | **Revisit sync vs export paradigm** | `playlist export` (stdout preview) vs `sync playlist` (bytes + `Playlists/*.m3u8` on volume) feels wrong in practice — two paths, easy to confuse, and export output is not Mixxx-importable on its own. Need a design pass: one operator mental model, when each command applies, and whether export should exist separately at all. Deferred — do not patch ad hoc until revisited. |
-| **Mixxx playlist import (relative paths)** | Likely fix: paths in `Playlists/tonight.m3u8` must be relative to the **playlist file** (`../Music/…`), not volume-root (`Music/…`). Real-world test: track file was on the USB, Mixxx still imported zero entries from Trove's m3u8. Also consider matching Mixxx's `#EXTINF` + path pairs and keeping `.m3u8` (UTF-8) as default. See Mixxx `parserm3u.cpp` and workspace reference exports `scratch.m3u` / `scratch.m3u8`. |
 | **`sync query --to` execution** | Plan-only today; playlist sync executes. |
 | **Daemon HTTP routes for flash workflow** | No sync/volume/export routes on `trove-serverd` yet. |
 | **UI flash-drive workflow** | React UI has search/playlists/import only. |
@@ -91,4 +90,3 @@ it.
 | Date | Change |
 | --- | --- |
 | 2026-07-08 | Created ADR 999. Added playlist `show` gap and runbooks-for-all-command-sets note. Seeded from ADR 001–006 and recent implementation work. |
-| 2026-07-08 | Mixxx m3u8 import failure on synced USB playlist; logged sync/export paradigm revisit + relative-path fix (`../Music/` from `Playlists/`). |
