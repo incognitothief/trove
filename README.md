@@ -9,8 +9,16 @@ a drive is lost, corrupted, or unavailable.
 > Query archive → select tracks/crate → plug in new SSD → export files → write
 > playlists → open in Mixxx
 
-The architecture is described in [`docs/adr/000-bootstrap.md`](docs/adr/000-bootstrap.md).
-The guiding principle: **everything but the bucket is disposable.**
+The guiding principle: **everything but the bucket is disposable.** Any laptop,
+its `~/.trove` cache, and any performance drive can be thrown away and rebuilt
+from the bucket on the next read.
+
+Architecture and rationale live in the ADRs:
+
+- [ADR 000 — Bootstrap Architecture](docs/adr/000-bootstrap.md)
+- [ADR 001 — Bootstrap Implementation Retrospective](docs/adr/001-bootstrap-implementation.md)
+
+For contributor/agent orientation, see [`AGENTS.md`](AGENTS.md).
 
 ## Workspace layout
 
@@ -22,92 +30,81 @@ trove/
 │   └── trove-serverd/   # thin local HTTP/JSON API → binary `trove-serverd`
 ├── ui/                  # React web UI (thin client over trove-serverd)
 ├── docs/adr/            # architecture decision records
-└── config.example.toml  # sample local config (copy to ~/.trove/config.toml)
+├── config.example.toml  # sample local config (copy to ~/.trove/config.toml)
+└── Makefile             # developer task shortcuts
 ```
 
 All domain logic lives in `trove-core`. The CLI, daemon, and UI are thin clients
-that hold no business logic — they only translate input into core calls.
-
-### `trove-core` modules
-
-| Module      | Responsibility                                             |
-| ----------- | ---------------------------------------------------------- |
-| `config`    | Local `~/.trove/config.toml`                               |
-| `model`     | Domain types (tracks, entries, playlists, volumes)         |
-| `store`     | Durable object store (bucket) abstraction + fs/stub impls  |
-| `db`        | Disposable local SQLite caches/bookkeeping                 |
-| `archive`   | Canonical bucket index + reconciliation                    |
-| `query`     | Declarative search over the archive                        |
-| `playlist`  | Logical crates/playlists                                   |
-| `volume`    | Removable performance volumes                              |
-| `sync`      | Resumable transfer/export planning                         |
-| `import`    | Resumable, crash-safe bulk import (`scan→…→commit`)        |
-| `facade`    | The `Trove` entry point clients drive                      |
+that hold no business logic — they only translate input into core calls, so a
+bug is fixed once and every surface benefits.
 
 ## Prerequisites
 
-- Rust (stable) — <https://rustup.rs>
-- Node 18+ (for the UI)
+- **Rust** (stable) — <https://rustup.rs>
+- **Node 18+** (for the UI)
 
-## Build & test
+## Quick start
 
 ```bash
-cargo build --workspace     # build core + cli + daemon
-cargo test  --workspace     # run tests
-cargo clippy --workspace --all-targets
+make deps      # install Rust + UI dependencies
+make build     # build the Rust workspace
+make dev       # run the daemon + web UI together (Ctrl-C stops both)
+# then open http://localhost:5273
 ```
 
-## Bootstrap storage backend
+Run `make` (or `make help`) to list every task. Common ones:
 
-The production object store will be S3 (`aws-sdk-s3`, multipart + staging).
-Until that lands, the CLI and daemon use a **filesystem-backed store** that
-simulates the bucket as a local directory, so everything runs end-to-end with no
-AWS credentials:
+| Task              | What it does                                        |
+| ----------------- | --------------------------------------------------- |
+| `make deps`       | Install Rust (`cargo fetch`) + UI (`npm install`)   |
+| `make build`      | Build core + CLI + daemon                           |
+| `make server`     | Run `trove-serverd` (default `127.0.0.1:7377`)      |
+| `make ui`         | Run the Vite dev server (proxies `/api` → daemon)   |
+| `make dev`        | Run the daemon and UI concurrently                  |
+| `make cli ARGS=…` | Run the CLI, e.g. `make cli ARGS="query --limit 20"`|
+| `make test`       | Run the Rust test suite                             |
+| `make lint`       | `cargo clippy --workspace --all-targets`            |
+| `make check`      | build + test + lint (pre-commit sanity)             |
+
+## Storage backend (bootstrap)
+
+Production storage will be S3 (`aws-sdk-s3`, multipart + staging). Until that
+lands, the CLI and daemon use a **filesystem-backed store** that simulates the
+bucket as a local directory, so everything runs end-to-end with no AWS
+credentials:
 
 - `TROVE_HOME` — local cache/config root (default `~/.trove`)
 - `TROVE_BUCKET_DIR` — simulated bucket directory (default `~/.trove/bucket-sim`)
+
+These are also honored by the Makefile, so you can isolate a demo:
+
+```bash
+make dev TROVE_HOME=/tmp/trove-demo/home TROVE_BUCKET_DIR=/tmp/trove-demo/bucket
+```
 
 ## Try the CLI
 
 ```bash
 # Import a folder (scan → hash → dedupe → upload → verify → commit → push index)
-cargo run -p trove-cli -- import ~/Music --plan     # dry-run: show the plan
-cargo run -p trove-cli -- import ~/Music            # run it
+make cli ARGS="import ~/Music --plan"    # dry-run: show the plan
+make cli ARGS="import ~/Music"           # run it
 
 # Search (reconciles the local cache with the bucket first)
-cargo run -p trove-cli -- query --artist "Theo Parrish"
-cargo run -p trove-cli -- query --bpm 118:124 --genre house
+make cli ARGS='query --artist "Theo Parrish"'
+make cli ARGS="query --bpm 118:124 --genre house"
 
-# Playlists
-cargo run -p trove-cli -- playlist create tonight
-cargo run -p trove-cli -- playlist add tonight <track-id>
-
-# Volumes
-cargo run -p trove-cli -- volume init /Volumes/DJ_USB --label GigDrive
+# Playlists / volumes
+make cli ARGS="playlist create tonight"
+make cli ARGS="volume init /Volumes/DJ_USB --label GigDrive"
 ```
 
-Run `cargo run -p trove-cli -- --help` for the full surface.
-
-## Run the daemon + UI
-
-```bash
-# Terminal 1: local API (binds 127.0.0.1:7377 by default)
-cargo run -p trove-serverd
-
-# Terminal 2: web UI (proxies /api to the daemon)
-cd ui && npm install && npm run dev
-# open http://localhost:5273
-```
+`make cli ARGS="--help"` prints the full command surface.
 
 ## Status
 
-This is the bootstrap scaffold from ADR 000. Fully wired end-to-end:
-config, local SQLite indexes, bucket reconciliation, declarative query,
-playlists, and the bulk-import pipeline (against the filesystem store).
-
-Next steps (clearly marked `NotImplemented`/TODO in code):
-
-- S3-backed `ObjectStore` with multipart + resumable uploads
-- Real audio metadata extraction (`lofty`/`symphonia`)
-- Transfer execution (download loop, retry/backoff, verification)
-- Playlist export (`.m3u8`) and per-volume diff/status
+This is the bootstrap scaffold. Fully wired end-to-end (against the filesystem
+store): config, local SQLite indexes, bucket reconciliation, declarative query,
+playlists, and the bulk-import pipeline. Deliberately deferred work (S3 store,
+real metadata extraction, transfer execution, `.m3u8` export, persistent import
+resume) is tracked in [ADR 001](docs/adr/001-bootstrap-implementation.md) and
+marked `NotImplemented` in code.
