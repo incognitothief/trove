@@ -161,17 +161,49 @@ enum VolumeCmd {
         #[arg(long)]
         label: Option<String>,
     },
-    /// Show a volume's identity.
+    /// Show a volume's identity and file stats.
     Status { mount_point: String },
+    /// List known volumes (host-side).
+    List,
+    /// Compare a playlist or query against a volume without transferring.
+    Diff {
+        mount_point: String,
+        #[arg(long)]
+        playlist: Option<String>,
+        #[command(flatten)]
+        query: QueryArgs,
+    },
 }
 
 #[derive(Subcommand)]
 enum SyncCmd {
-    /// Plan (and, once implemented, run) a sync of a playlist to a volume.
+    /// Sync a playlist to a volume.
     Playlist {
         name: String,
         #[arg(long)]
         to: String,
+        /// Print the plan without transferring.
+        #[arg(long)]
+        plan: bool,
+    },
+    /// Sync query results to a volume.
+    Query {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        plan: bool,
+        #[command(flatten)]
+        filters: QueryArgs,
+    },
+    /// Continue the latest active sync job.
+    Resume,
+    /// Verify tracks on a volume.
+    Verify {
+        mount_point: String,
+        #[arg(long)]
+        playlist: Option<String>,
+        #[command(flatten)]
+        query: QueryArgs,
     },
 }
 
@@ -431,23 +463,7 @@ fn print_run_result(job: &trove_core::import::ImportJob, json: bool) {
 
 fn query(cli: &Cli, args: &QueryArgs) -> Result<()> {
     let mut trove = runtime::open_trove()?;
-    let (bpm_min, bpm_max) = parse_range(args.bpm.as_deref())?;
-    let spec = QuerySpec {
-        text: args.text.clone(),
-        artist: args.artist.clone(),
-        album: args.album.clone(),
-        genre: args.genre.clone(),
-        key: args.key.clone(),
-        file_type: None,
-        bpm: Range {
-            min: bpm_min,
-            max: bpm_max,
-        },
-        year: Range::default(),
-        tags: Vec::new(),
-        limit: args.limit,
-    };
-
+    let spec = query_to_spec(args)?;
     let results = trove.query(&spec, cli.offline)?;
     if cli.json {
         println!("{}", serde_json::to_string_pretty(&results)?);
@@ -475,7 +491,7 @@ fn query(cli: &Cli, args: &QueryArgs) -> Result<()> {
 }
 
 fn playlist(cli: &Cli, cmd: &PlaylistCmd) -> Result<()> {
-    let trove = runtime::open_trove()?;
+    let mut trove = runtime::open_trove()?;
     match cmd {
         PlaylistCmd::Create { name } => {
             let pl = trove.playlist_create(name)?;
@@ -502,9 +518,13 @@ fn playlist(cli: &Cli, cmd: &PlaylistCmd) -> Result<()> {
                 }
             }
         }
-        PlaylistCmd::Export { name, format } => {
-            let _ = trove.playlist_get(name)?;
-            anyhow::bail!("playlist export ({format}) is not implemented in this bootstrap yet");
+        PlaylistCmd::Export { name, format: _ } => {
+            let export = trove.playlist_export(name, cli.offline)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&export)?);
+            } else {
+                print!("{}", export.body);
+            }
         }
     }
     Ok(())
@@ -512,9 +532,14 @@ fn playlist(cli: &Cli, cmd: &PlaylistCmd) -> Result<()> {
 
 fn volume(cli: &Cli, cmd: &VolumeCmd) -> Result<()> {
     use trove_core::volume;
+    let mut trove = runtime::open_trove()?;
     match cmd {
         VolumeCmd::Init { mount_point, label } => {
-            let identity = volume::init(std::path::Path::new(mount_point), label.clone())?;
+            let identity = volume::init(
+                std::path::Path::new(mount_point),
+                label.clone(),
+                Some(&trove.home),
+            )?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&identity)?);
             } else {
@@ -522,13 +547,68 @@ fn volume(cli: &Cli, cmd: &VolumeCmd) -> Result<()> {
             }
         }
         VolumeCmd::Status { mount_point } => {
-            match volume::read_identity(std::path::Path::new(mount_point))? {
-                Some(identity) => println!(
-                    "volume {} (label: {})",
+            let mount = std::path::Path::new(mount_point);
+            let (identity, stats) = trove.volume_status(mount)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "identity": identity,
+                        "stats": stats,
+                    }))?
+                );
+            } else {
+                println!(
+                    "volume {} (label: {})  copied={} pending={} stale={} failed={}",
                     identity.volume_id,
-                    identity.label.as_deref().unwrap_or("-")
-                ),
-                None => println!("no Trove identity found at {mount_point}"),
+                    identity.label.as_deref().unwrap_or("-"),
+                    stats.copied,
+                    stats.pending,
+                    stats.stale,
+                    stats.failed,
+                );
+            }
+        }
+        VolumeCmd::List => {
+            let volumes = trove.volume_list()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&volumes)?);
+            } else if volumes.is_empty() {
+                println!("no volumes");
+            } else {
+                for v in volumes {
+                    println!("{}  {}", v.volume_id, v.label.as_deref().unwrap_or("-"));
+                }
+            }
+        }
+        VolumeCmd::Diff {
+            mount_point,
+            playlist,
+            query,
+        } => {
+            let mount = std::path::Path::new(mount_point);
+            let spec = query_to_spec(query)?;
+            let diff = trove.volume_diff(
+                mount,
+                playlist.as_deref(),
+                if playlist.is_some() {
+                    None
+                } else {
+                    Some(&spec)
+                },
+                cli.offline,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&diff)?);
+            } else {
+                for entry in diff {
+                    println!(
+                        "{:>7}  {}  {}",
+                        format!("{:?}", entry.state).to_lowercase(),
+                        entry.track_id,
+                        entry.relative_path
+                    );
+                }
             }
         }
     }
@@ -538,20 +618,108 @@ fn volume(cli: &Cli, cmd: &VolumeCmd) -> Result<()> {
 fn sync(cli: &Cli, cmd: &SyncCmd) -> Result<()> {
     let mut trove = runtime::open_trove()?;
     match cmd {
-        SyncCmd::Playlist { name, to } => {
-            let plan = trove.plan_playlist_sync(name, cli.offline)?;
-            println!(
-                "sync plan for '{name}' -> {to}: {} transfer(s), {} byte(s) remaining",
-                plan.transfers.len(),
-                plan.bytes_remaining
-            );
-            for t in &plan.transfers {
-                println!("  {} -> {}", t.object_key, t.relative_path);
+        SyncCmd::Playlist { name, to, plan } => {
+            let mount = std::path::Path::new(to);
+            if *plan {
+                let plan = trove.plan_playlist_sync(name, mount, cli.offline)?;
+                print_sync_plan(name, to, &plan, cli.json);
+            } else {
+                let (plan, done, failed) = trove.run_playlist_sync(name, mount, cli.offline)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "plan": plan,
+                            "transferred": done,
+                            "failed": failed,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "synced '{name}' -> {to}: {done} transferred, {failed} failed, {} skipped",
+                        plan.already_present.len()
+                    );
+                }
             }
-            eprintln!("note: transfer execution is not implemented in this bootstrap yet");
+        }
+        SyncCmd::Query { to, plan, filters } => {
+            let mount = std::path::Path::new(to);
+            let spec = query_to_spec(filters)?;
+            let sync_plan = trove.plan_query_sync(&spec, mount, cli.offline)?;
+            if *plan {
+                print_sync_plan("query", to, &sync_plan, cli.json);
+            } else {
+                anyhow::bail!("query sync execution is not wired yet; use --plan to preview");
+            }
+        }
+        SyncCmd::Resume => {
+            let (done, failed) = trove.resume_sync(cli.offline)?;
+            println!("resumed sync: {done} transferred, {failed} failed");
+        }
+        SyncCmd::Verify {
+            mount_point,
+            playlist,
+            query,
+        } => {
+            let mount = std::path::Path::new(mount_point);
+            let spec = query_to_spec(query)?;
+            let (present, missing, stale) = trove.verify_volume_sync(
+                mount,
+                playlist.as_deref(),
+                if playlist.is_some() {
+                    None
+                } else {
+                    Some(&spec)
+                },
+                cli.offline,
+            )?;
+            println!("verify {mount_point}: {present} present, {missing} missing, {stale} stale");
         }
     }
     Ok(())
+}
+
+fn print_sync_plan(name: &str, mount: &str, plan: &trove_core::sync::SyncPlan, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "playlist": name,
+                "mount": mount,
+                "plan": plan,
+            }))
+            .expect("serialize plan")
+        );
+        return;
+    }
+    println!(
+        "sync plan for '{name}' -> {mount}: {} transfer(s), {} byte(s), {} already present",
+        plan.transfers.len(),
+        plan.bytes_remaining,
+        plan.already_present.len()
+    );
+    for t in &plan.transfers {
+        println!("  {} -> {}", t.object_key, t.relative_path);
+    }
+}
+
+fn query_to_spec(args: &QueryArgs) -> Result<QuerySpec> {
+    let (bpm_min, bpm_max) = parse_range(args.bpm.as_deref())?;
+    Ok(QuerySpec {
+        text: args.text.clone(),
+        artist: args.artist.clone(),
+        album: args.album.clone(),
+        genre: args.genre.clone(),
+        key: args.key.clone(),
+        file_type: None,
+        bpm: Range {
+            min: bpm_min,
+            max: bpm_max,
+        },
+        year: Range::default(),
+        tags: Vec::new(),
+        limit: args.limit,
+    })
 }
 
 /// Parse a `min:max` range where either side may be empty.

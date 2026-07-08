@@ -7,6 +7,8 @@
 pub mod archive;
 pub mod import;
 pub mod schema;
+pub mod transfer;
+pub mod volume;
 
 use std::path::Path;
 

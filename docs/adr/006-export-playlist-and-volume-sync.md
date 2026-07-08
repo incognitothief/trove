@@ -230,6 +230,31 @@ crate sync is future work.
   index; deleting unused files from volumes (`prune`) unless needed for a
   minimal `diff` story.
 
+---
+
+## Addendum: Initial implementation (2026-07-08)
+
+First cut of ADR 006 landed in core + CLI:
+
+- **Metadata-driven paths** — `display_filename()` uses title /
+  `source_path_original`, never the content hash; collision suffix `(2)`.
+- **`VolumeDb`** — host-side `~/.trove/volumes/{volume_id}.sqlite`; created on
+  `volume init`.
+- **`TransferDb`** — `sync_jobs` + `transfers` rows in `sync.sqlite`.
+- **Playlist sync execution** — `trove sync playlist <name> --to <mount>` downloads
+  from the bucket, writes under `Music/…`, updates volume DB, writes
+  `Playlists/<name>.m3u8`. `--plan` dry-runs.
+- **`trove sync query --to … --plan`** — plan-only for query-scoped sync;
+  execution deferred.
+- **`trove sync resume`** — continues the latest active sync job (playlist
+  sources only for now).
+- **`trove sync verify`** / **`trove volume diff`** — present / missing / stale.
+- **`trove playlist export`** — stdout or `--json` body.
+- **`trove volume list`** / enriched **`volume status`**.
+
+Still deferred: query sync execution, daemon HTTP routes for flash workflow,
+streaming download, UI flash surface, volume prune.
+
 ## Suggested sequencing relative to ADR 005
 
 ADR 005 and ADR 006 are independent at the code seams. Recommended order when

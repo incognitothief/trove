@@ -14,6 +14,8 @@ use crate::archive::CURRENT_SCHEMA_VERSION;
 use crate::config::Config;
 use crate::db::archive::ArchiveDb;
 use crate::db::import::{ImportDb, ImportJobSummary, ImportStatusReport};
+use crate::db::transfer::TransferDb;
+use crate::db::volume::VolumeFileStats;
 use crate::error::Result;
 use crate::import::ImportProgress;
 use crate::import::{self, ImportJob, ImportOptions, Phase};
@@ -23,7 +25,8 @@ use crate::model::{ArchiveEntry, ArtworkRecord, Playlist, TrackId};
 use crate::playlist::PlaylistDb;
 use crate::query::QuerySpec;
 use crate::store::{stub::StubStore, ObjectStore};
-use crate::sync::{self, SyncPlan};
+use crate::sync::{self, PlaylistExport, SyncPlan, VolumeDiffEntry};
+use crate::volume;
 
 /// Aggregates configuration, local databases, and the durable object store.
 pub struct Trove {
@@ -33,6 +36,7 @@ pub struct Trove {
     archive: ArchiveDb,
     playlists: PlaylistDb,
     import_db: ImportDb,
+    transfer_db: TransferDb,
     store: Box<dyn ObjectStore>,
     extractor: Box<dyn MetadataExtractor>,
 }
@@ -51,6 +55,7 @@ impl Trove {
         let archive = ArchiveDb::open(&home.join("archive.sqlite"))?;
         let playlists = PlaylistDb::open(&home.join("playlists.sqlite"))?;
         let import_db = ImportDb::open(&home.join("sync.sqlite"))?;
+        let transfer_db = TransferDb::open(&home.join("sync.sqlite"))?;
         Ok(Trove {
             config,
             home: home.to_path_buf(),
@@ -58,6 +63,7 @@ impl Trove {
             archive,
             playlists,
             import_db,
+            transfer_db,
             store,
             extractor: Box::new(StubExtractor),
         })
@@ -81,6 +87,7 @@ impl Trove {
             archive: ArchiveDb::in_memory()?,
             playlists: PlaylistDb::in_memory()?,
             import_db: ImportDb::in_memory()?,
+            transfer_db: TransferDb::in_memory()?,
             store,
             extractor: Box::new(StubExtractor),
         })
@@ -131,8 +138,11 @@ impl Trove {
 
     // --- Sync / export ---------------------------------------------------
 
-    /// Resolve the entries in a playlist and build a sync plan for a volume.
-    pub fn plan_playlist_sync(&mut self, name: &str, allow_offline: bool) -> Result<SyncPlan> {
+    fn resolve_playlist_entries(
+        &mut self,
+        name: &str,
+        allow_offline: bool,
+    ) -> Result<Vec<ArchiveEntry>> {
         self.reconcile(allow_offline)?;
         let playlist = self.playlists.get(name)?;
         let mut entries = Vec::new();
@@ -141,10 +151,206 @@ impl Trove {
                 entries.push(entry);
             }
         }
-        Ok(sync::plan_playlist_sync(
+        Ok(entries)
+    }
+
+    /// Resolve playlist entries and build a sync plan for a volume.
+    pub fn plan_playlist_sync(
+        &mut self,
+        name: &str,
+        mount: &Path,
+        allow_offline: bool,
+    ) -> Result<SyncPlan> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        let entries = self.resolve_playlist_entries(name, allow_offline)?;
+        sync::plan_sync(
             &entries,
             self.config.export.layout,
+            Some(&volume_db),
+            Some(mount),
+        )
+    }
+
+    /// Plan a sync from a query result set.
+    pub fn plan_query_sync(
+        &mut self,
+        spec: &QuerySpec,
+        mount: &Path,
+        allow_offline: bool,
+    ) -> Result<SyncPlan> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        let entries = self.query(spec, allow_offline)?;
+        sync::plan_sync(
+            &entries,
+            self.config.export.layout,
+            Some(&volume_db),
+            Some(mount),
+        )
+    }
+
+    /// Execute a playlist sync: transfer tracks and write the playlist file.
+    pub fn run_playlist_sync(
+        &mut self,
+        name: &str,
+        mount: &Path,
+        allow_offline: bool,
+    ) -> Result<(SyncPlan, usize, usize)> {
+        let plan = self.plan_playlist_sync(name, mount, allow_offline)?;
+        let (done, failed) = self.execute_sync_plan(name, mount, allow_offline, &plan)?;
+        let entries = self.resolve_playlist_entries(name, allow_offline)?;
+        let export = sync::export_playlist(
+            name,
+            &entries,
+            self.config.export.layout,
+            self.config.export.playlist_format,
+            self.config.mixxx.relative_paths,
+        );
+        sync::write_playlist_export(mount, &export)?;
+        Ok((plan, done, failed))
+    }
+
+    /// Continue the latest active sync job.
+    pub fn resume_sync(&mut self, allow_offline: bool) -> Result<(usize, usize)> {
+        let job = self
+            .transfer_db
+            .latest_active_job()?
+            .ok_or_else(|| crate::error::Error::not_found("active sync job"))?;
+        let mount = PathBuf::from(&job.mount_point);
+        let entries = if let Some(name) = &job.playlist_name {
+            self.resolve_playlist_entries(name, allow_offline)?
+        } else {
+            Vec::new()
+        };
+        let entries_by_id: std::collections::HashMap<String, ArchiveEntry> = entries
+            .iter()
+            .map(|e| (e.track_id.0.clone(), e.clone()))
+            .collect();
+        let identity = volume::read_identity(&mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        sync::run_sync_job(
+            &mount,
+            &entries_by_id,
+            &self.transfer_db,
+            &volume_db,
+            self.store.as_ref(),
+            &job.id,
+        )
+    }
+
+    /// Verify expected tracks on a mounted volume.
+    pub fn verify_volume_sync(
+        &mut self,
+        mount: &Path,
+        playlist_name: Option<&str>,
+        spec: Option<&QuerySpec>,
+        allow_offline: bool,
+    ) -> Result<(usize, usize, usize)> {
+        let entries = if let Some(name) = playlist_name {
+            self.resolve_playlist_entries(name, allow_offline)?
+        } else if let Some(spec) = spec {
+            self.query(spec, allow_offline)?
+        } else {
+            return Err(crate::error::Error::Other(
+                "verify requires --playlist or query filters".into(),
+            ));
+        };
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        sync::verify_volume(mount, &entries, self.config.export.layout, &volume_db)
+    }
+
+    /// Export a logical playlist as a portable file body + relative paths.
+    pub fn playlist_export(&mut self, name: &str, allow_offline: bool) -> Result<PlaylistExport> {
+        let entries = self.resolve_playlist_entries(name, allow_offline)?;
+        Ok(sync::export_playlist(
+            name,
+            &entries,
+            self.config.export.layout,
+            self.config.export.playlist_format,
+            self.config.mixxx.relative_paths,
         ))
+    }
+
+    /// List host-side volume records.
+    pub fn volume_list(&self) -> Result<Vec<crate::model::VolumeIdentity>> {
+        if self.home == Path::new(":memory:") {
+            return Ok(Vec::new());
+        }
+        volume::list_volumes(&self.home)
+    }
+
+    /// Volume identity plus file stats from the host DB.
+    pub fn volume_status(
+        &self,
+        mount: &Path,
+    ) -> Result<(crate::model::VolumeIdentity, VolumeFileStats)> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        Ok((identity, volume_db.stats()?))
+    }
+
+    /// Diff playlist or query tracks against a volume without transferring.
+    pub fn volume_diff(
+        &mut self,
+        mount: &Path,
+        playlist_name: Option<&str>,
+        spec: Option<&QuerySpec>,
+        allow_offline: bool,
+    ) -> Result<Vec<VolumeDiffEntry>> {
+        let entries = if let Some(name) = playlist_name {
+            self.resolve_playlist_entries(name, allow_offline)?
+        } else if let Some(spec) = spec {
+            self.query(spec, allow_offline)?
+        } else {
+            return Err(crate::error::Error::Other(
+                "diff requires --playlist or query filters".into(),
+            ));
+        };
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        sync::diff_volume(&entries, self.config.export.layout, &volume_db, mount)
+    }
+
+    fn execute_sync_plan(
+        &mut self,
+        playlist_name: &str,
+        mount: &Path,
+        allow_offline: bool,
+        plan: &SyncPlan,
+    ) -> Result<(usize, usize)> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        let job_id = self.transfer_db.create_job(
+            &identity.volume_id,
+            &mount.display().to_string(),
+            Some(playlist_name),
+        )?;
+        for transfer in &plan.transfers {
+            self.transfer_db
+                .insert_transfer(&job_id, &identity.volume_id, transfer)?;
+        }
+        let entries = self.resolve_playlist_entries(playlist_name, allow_offline)?;
+        let entries_by_id: std::collections::HashMap<String, ArchiveEntry> = entries
+            .iter()
+            .map(|e| (e.track_id.0.clone(), e.clone()))
+            .collect();
+        sync::run_sync_job(
+            mount,
+            &entries_by_id,
+            &self.transfer_db,
+            &volume_db,
+            self.store.as_ref(),
+            &job_id,
+        )
     }
 
     // --- Import ----------------------------------------------------------
