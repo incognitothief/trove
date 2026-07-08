@@ -16,10 +16,9 @@ REPO_ROOT="$(dirname -- "$SCRIPT_DIR")"
 
 CARGO="${CARGO:-cargo}"
 
-FEATURE_ARGS=()
-if [ -n "${CARGO_FEATURES:-}" ]; then
-  FEATURE_ARGS=(--features "$CARGO_FEATURES")
-fi
-
 cd -- "$REPO_ROOT"
-exec "$CARGO" run --quiet -p trove-cli "${FEATURE_ARGS[@]}" -- "$@"
+if [ -n "${CARGO_FEATURES:-}" ]; then
+  exec "$CARGO" run --quiet -p trove-cli --features "$CARGO_FEATURES" -- "$@"
+else
+  exec "$CARGO" run --quiet -p trove-cli -- "$@"
+fi

@@ -89,11 +89,12 @@ fi
 #    Run the built binary directly (not via 'cargo run') so this script owns its
 #    PID and Ctrl-C reliably stops it.
 log "building trove-serverd…"
-FEATURE_ARGS=()
 if [ -n "${CARGO_FEATURES:-}" ]; then
-  FEATURE_ARGS=(--features "$CARGO_FEATURES")
-fi
-if ! cargo build -p trove-serverd "${FEATURE_ARGS[@]}"; then
+  if ! cargo build -p trove-serverd --features "$CARGO_FEATURES"; then
+    fail "build failed"
+    exit 1
+  fi
+elif ! cargo build -p trove-serverd; then
   fail "build failed"
   exit 1
 fi
