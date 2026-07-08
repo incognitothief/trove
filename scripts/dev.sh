@@ -9,6 +9,7 @@
 #   TROVE_BUCKET_DIR  simulated bucket directory   (default $TROVE_HOME/bucket-sim)
 #   SERVERD_ADDR      daemon bind address          (default 127.0.0.1:7377)
 #   UI_PORT           Vite dev server port         (default 5273)
+#   CARGO_FEATURES    Cargo features for serverd   (e.g. s3 for real buckets)
 
 set -euo pipefail
 
@@ -88,7 +89,11 @@ fi
 #    Run the built binary directly (not via 'cargo run') so this script owns its
 #    PID and Ctrl-C reliably stops it.
 log "building trove-serverd…"
-if ! cargo build -p trove-serverd; then
+FEATURE_ARGS=()
+if [ -n "${CARGO_FEATURES:-}" ]; then
+  FEATURE_ARGS=(--features "$CARGO_FEATURES")
+fi
+if ! cargo build -p trove-serverd "${FEATURE_ARGS[@]}"; then
   fail "build failed"
   exit 1
 fi

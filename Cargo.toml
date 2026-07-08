@@ -45,5 +45,9 @@ axum = "0.7"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
+# AWS S3 (production object store; opt-in behind the `s3` feature, see ADR 003)
+aws-config = "1"
+aws-sdk-s3 = "1"
+
 [profile.release]
 lto = "thin"

@@ -36,6 +36,7 @@ CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist);
 CREATE INDEX IF NOT EXISTS idx_tracks_genre  ON tracks(genre);
 CREATE INDEX IF NOT EXISTS idx_tracks_bpm    ON tracks(bpm);
 CREATE INDEX IF NOT EXISTS idx_tracks_key    ON tracks(key_camelot);
+CREATE INDEX IF NOT EXISTS idx_tracks_sha256 ON tracks(sha256);
 "#;
 
 /// `~/.trove/playlists.sqlite` — logical Trove playlists/crates.

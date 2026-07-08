@@ -181,6 +181,19 @@ impl ArchiveDb {
         Ok(out)
     }
 
+    /// Fetch a single entry by content hash (archive-wide dedupe, ADR 004).
+    pub fn find_by_sha256(&self, sha256: &str) -> Result<Option<ArchiveEntry>> {
+        let entry = self
+            .conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM tracks WHERE sha256 = ?1 LIMIT 1"),
+                params![sha256],
+                row_to_entry,
+            )
+            .ok();
+        entry.transpose()
+    }
+
     /// Fetch a single entry by id.
     pub fn get(&self, id: &TrackId) -> Result<Option<ArchiveEntry>> {
         let entry = self

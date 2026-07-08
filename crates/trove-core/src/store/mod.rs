@@ -1,12 +1,18 @@
 //! Object store abstraction (the bucket).
 //!
 //! Trove never talks to S3 directly from clients; instead the core depends on
-//! this trait. The production implementation will wrap `aws-sdk-s3` (with
-//! multipart upload + staging-prefix support per ADR "S3 upload specifics").
-//! A [`stub::StubStore`] is provided so the rest of the core can be exercised
-//! without network or credentials during bootstrap.
+//! this trait. Three implementations exist:
+//!
+//! - [`fs::FsStore`] — a local directory tree simulating the bucket (bootstrap,
+//!   no credentials).
+//! - [`stub::StubStore`] — in-memory, for tests.
+//! - [`s3::S3Store`] — the production `aws-sdk-s3` backend (multipart uploads +
+//!   staging→`music/` promotion via server-side copy). Compiled only under the
+//!   `s3` feature to keep default builds fast and hermetic (ADR 001, ADR 003).
 
 pub mod fs;
+#[cfg(feature = "s3")]
+pub mod s3;
 pub mod stub;
 
 use crate::error::Result;
