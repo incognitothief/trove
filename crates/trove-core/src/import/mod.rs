@@ -136,23 +136,50 @@ const MAX_STORE_ATTEMPTS: u32 = 5;
 
 /// Plan a bulk import: scan `source_root`, hash each audio file, dedupe by
 /// content hash, and (per options) gather co-located cover art.
+///
+/// When `db` is provided, the job shell and per-file rows are persisted
+/// incrementally so an interrupt during fingerprinting remains resumable.
+/// Pass `resume_job_id` to continue an in-flight plan.
 pub fn plan(
     source_root: &Path,
     extensions: &[&str],
     options: &ImportOptions,
     archive: Option<&ArchiveDb>,
+    db: Option<&ImportDb>,
+    resume_job_id: Option<&str>,
     progress: &mut dyn ImportProgress,
 ) -> Result<ImportJob> {
-    let id = Uuid::new_v4().to_string();
+    let (id, staging_prefix, source_root, mut existing) = if let Some(job_id) = resume_job_id {
+        let (job, _) = db
+            .ok_or_else(|| Error::Other("resume requires ImportDb".into()))?
+            .load_job(job_id)?;
+        let mut by_path = std::collections::HashMap::new();
+        for file in job.files {
+            by_path.insert(file.path.clone(), file);
+        }
+        (job.id, job.staging_prefix, job.source_root, by_path)
+    } else {
+        let id = Uuid::new_v4().to_string();
+        let staging_prefix = format!("staging/{id}");
+        if let Some(db) = db {
+            db.create_job_shell(&id, source_root, &staging_prefix, options)?;
+        }
+        (
+            id.clone(),
+            staging_prefix,
+            source_root.to_path_buf(),
+            std::collections::HashMap::new(),
+        )
+    };
+
     let mut progress = progress::ProgressCtx::new(&id, Some(progress));
-    // Emit the job id before any fingerprinting work begins.
-    progress.job_created();
-    let mut files = Vec::new();
-    let mut seen_hashes = std::collections::HashSet::new();
+    if resume_job_id.is_none() {
+        progress.job_created();
+    }
 
     let mut discovered = Vec::new();
     scan_dir(
-        source_root,
+        &source_root,
         extensions,
         options.include_dotfiles,
         &mut discovered,
@@ -160,38 +187,70 @@ pub fn plan(
     discovered.sort();
 
     let total = discovered.len();
+    if let Some(db) = db {
+        db.set_total_files(&id, total)?;
+        db.insert_pending_files(&id, &discovered)?;
+        db.update_phase(&id, Phase::Fingerprint)?;
+    }
+
+    let mut seen_hashes: std::collections::HashSet<String> = existing
+        .values()
+        .filter(|f| matches!(f.state, FileState::Hashed | FileState::Duplicate))
+        .map(|f| f.sha256.clone())
+        .collect();
+
     progress.phase_start(Phase::Fingerprint, total);
 
+    let mut files = Vec::with_capacity(total);
     let mut done = 0usize;
     for path in &discovered {
+        let file = if let Some(existing) = existing.remove(path) {
+            if can_skip_fingerprint(&existing, path)? {
+                done += 1;
+                progress.file_done(Phase::Fingerprint, done, total, path, existing.state);
+                files.push(existing);
+                continue;
+            }
+            existing
+        } else {
+            PlannedFile {
+                path: path.clone(),
+                size: 0,
+                mtime: None,
+                sha256: String::new(),
+                state: FileState::Pending,
+                object_key: None,
+                track_id: None,
+                etag: None,
+                error: None,
+                attempts: 0,
+            }
+        };
+
+        let mut file = file;
+        file.state = FileState::Scanning;
+        persist_file(db, &id, &file)?;
+
         let meta = std::fs::metadata(path)?;
-        let size = meta.len();
-        let mtime = file_mtime_from_meta(&meta);
+        file.size = meta.len();
+        file.mtime = file_mtime_from_meta(&meta);
         let bytes = std::fs::read(path)?;
-        let sha256 = hash_bytes(&bytes);
+        file.sha256 = hash_bytes(&bytes);
         let already_in_archive = match archive {
-            Some(db) => db.find_by_sha256(&sha256)?.is_some(),
+            Some(db) => db.find_by_sha256(&file.sha256)?.is_some(),
             None => false,
         };
-        let state = if !seen_hashes.insert(sha256.clone()) || already_in_archive {
+        file.state = if !seen_hashes.insert(file.sha256.clone()) || already_in_archive {
             FileState::Duplicate
         } else {
             FileState::Hashed
         };
-        files.push(PlannedFile {
-            path: path.clone(),
-            size,
-            mtime,
-            sha256,
-            state,
-            object_key: None,
-            track_id: None,
-            etag: None,
-            error: None,
-            attempts: 0,
-        });
+        file.error = None;
+        persist_file(db, &id, &file)?;
+
         done += 1;
-        progress.file_done(Phase::Fingerprint, done, total, path, state);
+        progress.file_done(Phase::Fingerprint, done, total, path, file.state);
+        files.push(file);
     }
 
     progress.phase_done(Phase::Dedupe, done, total);
@@ -202,14 +261,31 @@ pub fn plan(
         Vec::new()
     };
 
+    if let Some(db) = db {
+        db.update_phase(&id, Phase::Dedupe)?;
+        db.save_artwork(&id, &artwork)?;
+    }
+
     Ok(ImportJob {
-        id: id.clone(),
-        source_root: source_root.to_path_buf(),
-        staging_prefix: format!("staging/{id}"),
+        id,
+        source_root,
+        staging_prefix,
         phase: Phase::Dedupe,
         files,
         artwork,
     })
+}
+
+/// Whether a previously fingerprinted file can be skipped on resume.
+fn can_skip_fingerprint(file: &PlannedFile, path: &Path) -> Result<bool> {
+    if !matches!(file.state, FileState::Hashed | FileState::Duplicate) {
+        return Ok(false);
+    }
+    if file.sha256.is_empty() {
+        return Ok(false);
+    }
+    let meta = std::fs::metadata(path)?;
+    Ok(file.size == meta.len() && file.mtime == file_mtime_from_meta(&meta))
 }
 
 /// Reset incomplete upload states so resume can retry safely.

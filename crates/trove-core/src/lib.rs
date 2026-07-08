@@ -48,7 +48,7 @@ mod tests {
     use super::*;
     use crate::archive::index::{self, BucketPaths};
     use crate::archive::reconcile::ReconcileReport;
-    use crate::import::{FileState, NoopImportProgress};
+    use crate::import::{FileState, NoopImportProgress, Phase};
     use crate::model::SchemaVersion;
     use crate::store::{stub::StubStore, ObjectStore};
     use chrono::Utc;
@@ -172,6 +172,8 @@ mod tests {
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
             &ImportOptions::default(),
             None,
+            None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -197,6 +199,8 @@ mod tests {
                 include_dotfiles: false,
                 capture_artwork: false,
             },
+            None,
+            None,
             None,
             &mut progress,
         )
@@ -339,6 +343,78 @@ mod tests {
         let committed = trove2.import_commit_job(&job.id, &mut progress2).unwrap();
         assert_eq!(committed, 2);
         assert_eq!(trove2.import_status(&job.id).unwrap().stats.committed, 2);
+    }
+
+    #[test]
+    fn import_resume_completes_interrupted_fingerprint() {
+        use sha2::{Digest, Sha256};
+
+        fn sha256_hex(bytes: &[u8]) -> String {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mp3"), b"audio-a").unwrap();
+        std::fs::write(dir.path().join("b.mp3"), b"audio-b").unwrap();
+        std::fs::write(dir.path().join("c.mp3"), b"audio-c").unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        let db = crate::db::import::ImportDb::open(&home.path().join("sync.sqlite")).unwrap();
+        let id = "partial-fingerprint-job";
+        let staging = format!("staging/{id}");
+        db.create_job_shell(id, dir.path(), &staging, &ImportOptions::default())
+            .unwrap();
+        let paths = vec![
+            dir.path().join("a.mp3"),
+            dir.path().join("b.mp3"),
+            dir.path().join("c.mp3"),
+        ];
+        db.set_total_files(id, paths.len()).unwrap();
+        db.insert_pending_files(id, &paths).unwrap();
+
+        for (path, bytes) in [
+            (paths[0].clone(), b"audio-a".as_slice()),
+            (paths[1].clone(), b"audio-b".as_slice()),
+        ] {
+            let meta = std::fs::metadata(&path).unwrap();
+            db.update_file(
+                id,
+                &crate::import::PlannedFile {
+                    path,
+                    size: meta.len(),
+                    mtime: meta.modified().ok().map(|t| {
+                        use std::time::UNIX_EPOCH;
+                        let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+                        format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
+                    }),
+                    sha256: sha256_hex(bytes),
+                    state: FileState::Hashed,
+                    object_key: None,
+                    track_id: None,
+                    etag: None,
+                    error: None,
+                    attempts: 0,
+                },
+            )
+            .unwrap();
+        }
+
+        let trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new())).unwrap();
+        let mut progress = NoopImportProgress;
+        let jobs = trove.import_list(false).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].phase, Phase::Fingerprint);
+
+        let job = trove.import_continue_plan(id, &mut progress).unwrap();
+        assert_eq!(job.phase, Phase::Dedupe);
+        assert_eq!(job.files.len(), 3);
+        assert!(job
+            .files
+            .iter()
+            .all(|f| { matches!(f.state, FileState::Hashed | FileState::Duplicate) }));
     }
 
     #[test]

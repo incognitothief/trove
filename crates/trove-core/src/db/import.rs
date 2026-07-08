@@ -59,6 +59,82 @@ impl ImportDb {
         Ok(ImportDb { conn })
     }
 
+    /// Create a durable job shell before fingerprinting begins.
+    pub fn create_job_shell(
+        &self,
+        id: &str,
+        source_root: &Path,
+        staging_prefix: &str,
+        options: &ImportOptions,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO import_jobs (
+                id, source_root, phase, staging_prefix, total_files,
+                include_dotfiles, capture_artwork, artwork_json,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, NULL, ?7, ?7)",
+            params![
+                id,
+                source_root.display().to_string(),
+                Phase::Fingerprint.as_str(),
+                staging_prefix,
+                options.include_dotfiles as i32,
+                options.capture_artwork as i32,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record how many files were discovered for an in-flight plan.
+    pub fn set_total_files(&self, job_id: &str, total: usize) -> Result<()> {
+        self.conn.execute(
+            "UPDATE import_jobs SET total_files = ?1, updated_at = ?2 WHERE id = ?3",
+            params![total as i64, Utc::now().to_rfc3339(), job_id],
+        )?;
+        Ok(())
+    }
+
+    /// Insert placeholder rows for discovered paths (idempotent on resume).
+    pub fn insert_pending_files(&self, job_id: &str, paths: &[PathBuf]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for path in paths {
+            tx.execute(
+                "INSERT INTO import_files (
+                    job_id, path, size, mtime, sha256, metadata_extracted, state,
+                    s3_object_key, track_id, etag, error, attempts
+                 ) VALUES (?1, ?2, NULL, NULL, '', 0, ?3, NULL, NULL, NULL, NULL, 0)
+                 ON CONFLICT(job_id, path) DO NOTHING",
+                params![
+                    job_id,
+                    path.display().to_string(),
+                    FileState::Pending.as_str()
+                ],
+            )?;
+        }
+        tx.execute(
+            "UPDATE import_jobs SET updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), job_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist artwork candidates after plan completes.
+    pub fn save_artwork(&self, job_id: &str, artwork: &[ArtworkCandidate]) -> Result<()> {
+        let artwork_json = if artwork.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(artwork)?)
+        };
+        self.conn.execute(
+            "UPDATE import_jobs SET artwork_json = ?1, updated_at = ?2 WHERE id = ?3",
+            params![artwork_json, Utc::now().to_rfc3339(), job_id],
+        )?;
+        Ok(())
+    }
+
     /// Persist a full job snapshot (job row + all file rows).
     pub fn save_job(&self, job: &ImportJob, options: &ImportOptions) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -328,9 +404,9 @@ fn insert_file(conn: &Connection, job_id: &str, file: &PlannedFile) -> Result<()
 
 fn row_to_planned_file(r: &Row<'_>) -> rusqlite::Result<PlannedFile> {
     let path: String = r.get(0)?;
-    let size: i64 = r.get(1)?;
+    let size: Option<i64> = r.get(1)?;
     let mtime: Option<String> = r.get(2)?;
-    let sha256: String = r.get(3)?;
+    let sha256: Option<String> = r.get(3)?;
     let state_str: String = r.get(4)?;
     let object_key: Option<String> = r.get(5)?;
     let track_id: Option<String> = r.get(6)?;
@@ -340,9 +416,9 @@ fn row_to_planned_file(r: &Row<'_>) -> rusqlite::Result<PlannedFile> {
     let state = FileState::parse(&state_str).unwrap_or(FileState::Failed);
     Ok(PlannedFile {
         path: PathBuf::from(path),
-        size: size as u64,
+        size: size.unwrap_or(0) as u64,
         mtime,
-        sha256,
+        sha256: sha256.unwrap_or_default(),
         state,
         object_key,
         track_id: track_id.map(TrackId),

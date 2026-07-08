@@ -16,7 +16,7 @@ use crate::db::archive::ArchiveDb;
 use crate::db::import::{ImportDb, ImportJobSummary, ImportStatusReport};
 use crate::error::Result;
 use crate::import::ImportProgress;
-use crate::import::{self, ImportJob, ImportOptions};
+use crate::import::{self, ImportJob, ImportOptions, Phase};
 use crate::metadata::{MetadataExtractor, StubExtractor};
 use crate::model::SchemaVersion;
 use crate::model::{ArchiveEntry, ArtworkRecord, Playlist, TrackId};
@@ -162,9 +162,34 @@ impl Trove {
             import::DEFAULT_AUDIO_EXTENSIONS,
             options,
             Some(&self.archive),
+            Some(&self.import_db),
+            None,
             progress,
         )?;
         self.import_db.save_job(&job, options)?;
+        if self.home != Path::new(":memory:") {
+            import::write_manifest(&self.home, &job)?;
+        }
+        Ok(job)
+    }
+
+    /// Continue fingerprinting for a job interrupted during plan.
+    pub fn import_continue_plan(
+        &self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
+        let (job, options) = self.import_db.load_job(job_id)?;
+        let job = import::plan(
+            &job.source_root,
+            import::DEFAULT_AUDIO_EXTENSIONS,
+            &options,
+            Some(&self.archive),
+            Some(&self.import_db),
+            Some(job_id),
+            progress,
+        )?;
+        self.import_db.save_job(&job, &options)?;
         if self.home != Path::new(":memory:") {
             import::write_manifest(&self.home, &job)?;
         }
@@ -249,12 +274,16 @@ impl Trove {
         Ok(committed.len())
     }
 
-    /// Continue upload + verify from the last safe state (no commit).
+    /// Continue from the last safe state (fingerprint, upload, or verify).
     pub fn import_resume(
         &mut self,
         job_id: &str,
         progress: &mut dyn ImportProgress,
     ) -> Result<ImportJob> {
+        let (job, _) = self.import_db.load_job(job_id)?;
+        if job.phase == Phase::Fingerprint {
+            self.import_continue_plan(job_id, progress)?;
+        }
         self.import_run_job(job_id, progress)
     }
 
