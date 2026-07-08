@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Thin wrapper around the trove CLI so you can run it from anywhere without
+# fighting make's option parsing:
+#
+#   trove import /Volumes/T72/music/library/Ahwlee/Life2 --plan
+#   trove query --limit 20
+#
+# All arguments are forwarded verbatim to `cargo run -p trove-cli`.
+set -euo pipefail
+
+# Resolve the repo root (the directory containing this script's parent), so the
+# wrapper works regardless of the caller's current directory.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+REPO_ROOT="$(dirname -- "$SCRIPT_DIR")"
+
+CARGO="${CARGO:-cargo}"
+
+cd -- "$REPO_ROOT"
+exec "$CARGO" run --quiet -p trove-cli -- "$@"

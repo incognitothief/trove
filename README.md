@@ -29,6 +29,7 @@ trove/
 │   ├── trove-cli/       # thin CLI client  → binary `trove`
 │   └── trove-serverd/   # thin local HTTP/JSON API → binary `trove-serverd`
 ├── ui/                  # React web UI (thin client over trove-serverd)
+├── bin/trove            # convenience wrapper → runs the CLI from anywhere
 ├── docs/adr/            # architecture decision records
 ├── config.example.toml  # sample local config (copy to ~/.trove/config.toml)
 ├── scripts/             # dev/boot scripts (e.g. scripts/dev.sh)
@@ -62,7 +63,7 @@ Run `make` (or `make help`) to list every task. Common ones:
 | `make server`     | Run `trove-serverd` (default `127.0.0.1:7377`)      |
 | `make ui`         | Run the Vite dev server (proxies `/api` → daemon)   |
 | `make dev`        | Boot the stack via `scripts/dev.sh` (waits + banner)|
-| `make cli ARGS=…` | Run the CLI, e.g. `make cli ARGS="query --limit 20"`|
+| `make cli …`      | Run the CLI (see [Try the CLI](#try-the-cli) for arg rules)|
 | `make test`       | Run the Rust test suite                             |
 | `make lint`       | `cargo clippy --workspace --all-targets`            |
 | `make check`      | build + test + lint (pre-commit sanity)             |
@@ -85,21 +86,42 @@ make dev TROVE_HOME=/tmp/trove-demo/home TROVE_BUCKET_DIR=/tmp/trove-demo/bucket
 
 ## Try the CLI
 
+There are two ways to run the CLI. The `bin/trove` wrapper is the easy one — it
+forwards every argument straight to the CLI and works from any directory, so you
+can use flags naturally:
+
 ```bash
 # Import a folder (scan → hash → dedupe → upload → verify → commit → push index)
-make cli ARGS="import ~/Music --plan"    # dry-run: show the plan
-make cli ARGS="import ~/Music"           # run it
+bin/trove import ~/Music --plan          # dry-run: show the plan
+bin/trove import ~/Music                  # run it
 
 # Search (reconciles the local cache with the bucket first)
-make cli ARGS='query --artist "Theo Parrish"'
-make cli ARGS="query --bpm 118:124 --genre house"
+bin/trove query --artist "Theo Parrish"
+bin/trove query --bpm 118:124 --genre house
 
 # Playlists / volumes
-make cli ARGS="playlist create tonight"
-make cli ARGS="volume init /Volumes/DJ_USB --label GigDrive"
+bin/trove playlist create tonight
+bin/trove volume init /Volumes/DJ_USB --label GigDrive
 ```
 
-`make cli ARGS="--help"` prints the full command surface.
+Put `bin/` on your `PATH` (or symlink `bin/trove` into a dir already on it) to
+drop the prefix and just run `trove import ~/Music --plan` from anywhere:
+
+```bash
+export PATH="$PWD/bin:$PATH"   # add to ~/.zshrc to make it permanent
+```
+
+The same commands are also available through `make cli`, with one catch: because
+`make` parses leading-dash arguments as its *own* options, you must place a `--`
+before any CLI flags. Positional arguments need no `--`.
+
+```bash
+make cli import ~/Music -- --plan        # note the `--` before --plan
+make cli query -- --limit 20
+make cli ARGS="query --artist 'Theo Parrish'"   # or pass everything via ARGS
+```
+
+`bin/trove --help` (or `make cli -- --help`) prints the full command surface.
 
 ## Status
 
