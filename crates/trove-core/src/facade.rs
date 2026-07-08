@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::db::archive::ArchiveDb;
 use crate::db::import::{ImportDb, ImportJobSummary, ImportStatusReport};
 use crate::error::Result;
+use crate::import::ImportProgress;
 use crate::import::{self, ImportJob, ImportOptions};
 use crate::metadata::{MetadataExtractor, StubExtractor};
 use crate::model::SchemaVersion;
@@ -150,12 +151,18 @@ impl Trove {
 
     /// Plan a bulk import (scan + hash + dedupe + gather art), persist to
     /// `sync.sqlite`, and write a local manifest.
-    pub fn import_plan(&self, source_root: &Path, options: &ImportOptions) -> Result<ImportJob> {
+    pub fn import_plan(
+        &self,
+        source_root: &Path,
+        options: &ImportOptions,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
         let job = import::plan(
             source_root,
             import::DEFAULT_AUDIO_EXTENSIONS,
             options,
             Some(&self.archive),
+            progress,
         )?;
         self.import_db.save_job(&job, options)?;
         if self.home != Path::new(":memory:") {
@@ -165,7 +172,11 @@ impl Trove {
     }
 
     /// Upload + verify for a persisted job (no commit).
-    pub fn import_run_job(&mut self, job_id: &str) -> Result<ImportJob> {
+    pub fn import_run_job(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
         let (mut job, options) = self.import_db.load_job(job_id)?;
         import::prepare_for_resume(&mut job);
         import::refresh_changed_files(&mut job)?;
@@ -174,8 +185,14 @@ impl Trove {
             self.store.as_ref(),
             &self.paths,
             Some(&self.import_db),
+            progress,
         )?;
-        import::verify(&mut job, self.store.as_ref(), Some(&self.import_db))?;
+        import::verify(
+            &mut job,
+            self.store.as_ref(),
+            Some(&self.import_db),
+            progress,
+        )?;
         self.import_db.save_job(&job, &options)?;
         if self.home != Path::new(":memory:") {
             import::write_manifest(&self.home, &job)?;
@@ -184,9 +201,18 @@ impl Trove {
     }
 
     /// Re-verify staged objects for a persisted job.
-    pub fn import_verify_job(&mut self, job_id: &str) -> Result<ImportJob> {
+    pub fn import_verify_job(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
         let (mut job, options) = self.import_db.load_job(job_id)?;
-        import::verify(&mut job, self.store.as_ref(), Some(&self.import_db))?;
+        import::verify(
+            &mut job,
+            self.store.as_ref(),
+            Some(&self.import_db),
+            progress,
+        )?;
         self.import_db.save_job(&job, &options)?;
         if self.home != Path::new(":memory:") {
             import::write_manifest(&self.home, &job)?;
@@ -195,7 +221,11 @@ impl Trove {
     }
 
     /// Commit verified files, capture artwork, and push the canonical index.
-    pub fn import_commit_job(&mut self, job_id: &str) -> Result<usize> {
+    pub fn import_commit_job(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<usize> {
         let (mut job, options) = self.import_db.load_job(job_id)?;
         let committed = import::commit(
             &mut job,
@@ -204,6 +234,7 @@ impl Trove {
             &self.archive,
             self.extractor.as_ref(),
             Some(&self.import_db),
+            progress,
         )?;
         for entry in &committed {
             self.archive.upsert(entry)?;
@@ -219,8 +250,12 @@ impl Trove {
     }
 
     /// Continue upload + verify from the last safe state (no commit).
-    pub fn import_resume(&mut self, job_id: &str) -> Result<ImportJob> {
-        self.import_run_job(job_id)
+    pub fn import_resume(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
+        self.import_run_job(job_id, progress)
     }
 
     /// Structured per-job status.
@@ -238,23 +273,34 @@ impl Trove {
         &mut self,
         source_root: &Path,
         options: &ImportOptions,
+        progress: &mut dyn ImportProgress,
     ) -> Result<(ImportJob, usize)> {
-        let job = self.import_plan(source_root, options)?;
-        self.import_run_job(&job.id)?;
-        let committed = self.import_commit_job(&job.id)?;
+        let job = self.import_plan(source_root, options, progress)?;
+        self.import_run_job(&job.id, progress)?;
+        let committed = self.import_commit_job(&job.id, progress)?;
         let (job, _) = self.import_db.load_job(&job.id)?;
         Ok((job, committed))
     }
 
     /// Run a planned import to completion: upload → verify → commit, capture any
     /// co-located cover art, then advance the canonical index (only after commit).
-    pub fn import_run(&mut self, job: &mut ImportJob) -> Result<usize> {
+    pub fn import_run(
+        &mut self,
+        job: &mut ImportJob,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<usize> {
         let options = self.loaded_options(&job.id).unwrap_or_default();
         self.import_db.save_job(job, &options)?;
         import::prepare_for_resume(job);
         import::refresh_changed_files(job)?;
-        import::upload(job, self.store.as_ref(), &self.paths, Some(&self.import_db))?;
-        import::verify(job, self.store.as_ref(), Some(&self.import_db))?;
+        import::upload(
+            job,
+            self.store.as_ref(),
+            &self.paths,
+            Some(&self.import_db),
+            progress,
+        )?;
+        import::verify(job, self.store.as_ref(), Some(&self.import_db), progress)?;
         let committed = import::commit(
             job,
             self.store.as_ref(),
@@ -262,6 +308,7 @@ impl Trove {
             &self.archive,
             self.extractor.as_ref(),
             Some(&self.import_db),
+            progress,
         )?;
         for entry in &committed {
             self.archive.upsert(entry)?;

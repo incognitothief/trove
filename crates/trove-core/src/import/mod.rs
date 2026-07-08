@@ -5,6 +5,7 @@
 //! resumes without rescanning or rehashing finished files. Canonical audio keys
 //! are content-addressed (`music/<sha256>.<ext>`, ADR 004).
 
+pub mod progress;
 pub mod state;
 
 use std::path::{Path, PathBuf};
@@ -24,6 +25,9 @@ use crate::metadata::MetadataExtractor;
 use crate::model::{ArchiveEntry, ArtworkRecord, TrackId};
 use crate::store::ObjectStore;
 
+pub use progress::{
+    ImportProgress, ImportProgressEvent, ImportProgressKind, NoopImportProgress, ProgressCtx,
+};
 pub use state::{FileState, Phase};
 
 /// Options controlling scan-time import behavior (ADR 002).
@@ -137,8 +141,12 @@ pub fn plan(
     extensions: &[&str],
     options: &ImportOptions,
     archive: Option<&ArchiveDb>,
+    progress: &mut dyn ImportProgress,
 ) -> Result<ImportJob> {
     let id = Uuid::new_v4().to_string();
+    let mut progress = progress::ProgressCtx::new(&id, Some(progress));
+    // Emit the job id before any fingerprinting work begins.
+    progress.job_created();
     let mut files = Vec::new();
     let mut seen_hashes = std::collections::HashSet::new();
 
@@ -151,6 +159,10 @@ pub fn plan(
     )?;
     discovered.sort();
 
+    let total = discovered.len();
+    progress.phase_start(Phase::Fingerprint, total);
+
+    let mut done = 0usize;
     for path in &discovered {
         let meta = std::fs::metadata(path)?;
         let size = meta.len();
@@ -178,7 +190,11 @@ pub fn plan(
             error: None,
             attempts: 0,
         });
+        done += 1;
+        progress.file_done(Phase::Fingerprint, done, total, path, state);
     }
+
+    progress.phase_done(Phase::Dedupe, done, total);
 
     let artwork = if options.capture_artwork {
         gather_artwork(&discovered, options.include_dotfiles)?
@@ -324,12 +340,23 @@ pub fn upload(
     store: &dyn ObjectStore,
     paths: &BucketPaths,
     db: Option<&ImportDb>,
+    progress: &mut dyn ImportProgress,
 ) -> Result<()> {
     job.phase = Phase::Upload;
     if let Some(db) = db {
         db.update_phase(&job.id, job.phase)?;
     }
 
+    let mut progress = progress::ProgressCtx::new(&job.id, Some(progress));
+
+    let pending = job
+        .files
+        .iter()
+        .filter(|f| matches!(f.state, FileState::Hashed))
+        .count();
+    progress.phase_start(Phase::Upload, pending);
+
+    let mut done = 0usize;
     for file in job.files.iter_mut() {
         if !matches!(file.state, FileState::Hashed) {
             continue;
@@ -355,7 +382,11 @@ pub fn upload(
             }
         }
         persist_file(db, &job.id, file)?;
+        done += 1;
+        progress.file_done(Phase::Upload, done, pending, &file.path, file.state);
     }
+
+    progress.phase_done(Phase::Upload, done, pending);
 
     job.phase = Phase::Verify;
     if let Some(db) = db {
@@ -365,12 +396,27 @@ pub fn upload(
 }
 
 /// Verify uploaded objects by size (and presence) before commit.
-pub fn verify(job: &mut ImportJob, store: &dyn ObjectStore, db: Option<&ImportDb>) -> Result<()> {
+pub fn verify(
+    job: &mut ImportJob,
+    store: &dyn ObjectStore,
+    db: Option<&ImportDb>,
+    progress: &mut dyn ImportProgress,
+) -> Result<()> {
     job.phase = Phase::Verify;
     if let Some(db) = db {
         db.update_phase(&job.id, job.phase)?;
     }
 
+    let mut progress = progress::ProgressCtx::new(&job.id, Some(progress));
+
+    let pending = job
+        .files
+        .iter()
+        .filter(|f| f.state == FileState::Uploaded)
+        .count();
+    progress.phase_start(Phase::Verify, pending);
+
+    let mut done = 0usize;
     for file in job.files.iter_mut() {
         if file.state != FileState::Uploaded {
             continue;
@@ -381,6 +427,8 @@ pub fn verify(job: &mut ImportJob, store: &dyn ObjectStore, db: Option<&ImportDb
                 file.state = FileState::Failed;
                 file.error = Some("uploaded file missing object key".into());
                 persist_file(db, &job.id, file)?;
+                done += 1;
+                progress.file_done(Phase::Verify, done, pending, &file.path, file.state);
                 continue;
             }
         };
@@ -408,7 +456,11 @@ pub fn verify(job: &mut ImportJob, store: &dyn ObjectStore, db: Option<&ImportDb
             }
         }
         persist_file(db, &job.id, file)?;
+        done += 1;
+        progress.file_done(Phase::Verify, done, pending, &file.path, file.state);
     }
+
+    progress.phase_done(Phase::Verify, done, pending);
 
     job.phase = Phase::Commit;
     if let Some(db) = db {
@@ -425,13 +477,24 @@ pub fn commit(
     archive: &ArchiveDb,
     extractor: &dyn MetadataExtractor,
     db: Option<&ImportDb>,
+    progress: &mut dyn ImportProgress,
 ) -> Result<Vec<ArchiveEntry>> {
     job.phase = Phase::Commit;
     if let Some(db) = db {
         db.update_phase(&job.id, job.phase)?;
     }
 
+    let mut progress = progress::ProgressCtx::new(&job.id, Some(progress));
+
+    let pending = job
+        .files
+        .iter()
+        .filter(|f| f.state == FileState::Verified)
+        .count();
+    progress.phase_start(Phase::Commit, pending);
+
     let mut committed = Vec::new();
+    let mut done = 0usize;
     for file in job.files.iter_mut() {
         if file.state != FileState::Verified {
             continue;
@@ -442,6 +505,8 @@ pub fn commit(
             file.track_id = Some(existing.track_id.clone());
             file.state = FileState::Duplicate;
             persist_file(db, &job.id, file)?;
+            done += 1;
+            progress.file_done(Phase::Commit, done, pending, &file.path, file.state);
             continue;
         }
 
@@ -467,6 +532,8 @@ pub fn commit(
             file.state = FileState::Failed;
             file.error = Some(e.to_string());
             persist_file(db, &job.id, file)?;
+            done += 1;
+            progress.file_done(Phase::Commit, done, pending, &file.path, file.state);
             continue;
         }
 
@@ -490,7 +557,11 @@ pub fn commit(
         file.track_id = Some(track_id);
         file.state = FileState::Committed;
         persist_file(db, &job.id, file)?;
+        done += 1;
+        progress.file_done(Phase::Commit, done, pending, &file.path, file.state);
     }
+
+    progress.phase_done(Phase::Commit, done, pending);
 
     job.phase = Phase::Done;
     if let Some(db) = db {

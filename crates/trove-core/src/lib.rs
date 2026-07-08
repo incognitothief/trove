@@ -39,6 +39,7 @@ pub use db::import::{ImportJobSummary, ImportStatusReport};
 pub use error::{Error, Result};
 pub use facade::Trove;
 pub use import::ImportOptions;
+pub use import::{ImportProgress, ImportProgressEvent, ImportProgressKind, NoopImportProgress};
 pub use model::{ArchiveEntry, Metadata, Playlist, TrackId};
 pub use query::QuerySpec;
 
@@ -47,7 +48,7 @@ mod tests {
     use super::*;
     use crate::archive::index::{self, BucketPaths};
     use crate::archive::reconcile::ReconcileReport;
-    use crate::import::FileState;
+    use crate::import::{FileState, NoopImportProgress};
     use crate::model::SchemaVersion;
     use crate::store::{stub::StubStore, ObjectStore};
     use chrono::Utc;
@@ -165,11 +166,13 @@ mod tests {
         std::fs::write(album.join("notes.txt"), b"not audio, not image").unwrap();
 
         // Default options: exclude dotfiles, capture artwork.
+        let mut progress = NoopImportProgress;
         let job = crate::import::plan(
             dir.path(),
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
             &ImportOptions::default(),
             None,
+            &mut progress,
         )
         .unwrap();
         assert_eq!(job.files.len(), 1, "only the real audio track is imported");
@@ -186,6 +189,7 @@ mod tests {
         assert_eq!(records[0].source_folder, album.display().to_string());
 
         // Opting out of artwork yields no candidates.
+        let mut progress = NoopImportProgress;
         let no_art = crate::import::plan(
             dir.path(),
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
@@ -194,6 +198,7 @@ mod tests {
                 capture_artwork: false,
             },
             None,
+            &mut progress,
         )
         .unwrap();
         assert!(no_art.artwork.is_empty());
@@ -205,11 +210,12 @@ mod tests {
         std::fs::write(dir.path().join("01 - track.mp3"), b"audio-bytes").unwrap();
 
         let mut trove = Trove::in_memory(test_config()).unwrap();
+        let mut progress = NoopImportProgress;
         let mut job = trove
-            .import_plan(dir.path(), &ImportOptions::default())
+            .import_plan(dir.path(), &ImportOptions::default(), &mut progress)
             .unwrap();
         let sha = job.files[0].sha256.clone();
-        let committed = trove.import_run(&mut job).unwrap();
+        let committed = trove.import_run(&mut job, &mut progress).unwrap();
         assert_eq!(committed, 1);
 
         let results = trove.query(&QuerySpec::new(), false).unwrap();
@@ -227,17 +233,18 @@ mod tests {
         std::fs::write(dir2.path().join("second.mp3"), b"same-bytes").unwrap();
 
         let mut trove = Trove::in_memory(test_config()).unwrap();
+        let mut progress = NoopImportProgress;
         let mut first = trove
-            .import_plan(dir1.path(), &ImportOptions::default())
+            .import_plan(dir1.path(), &ImportOptions::default(), &mut progress)
             .unwrap();
-        assert_eq!(trove.import_run(&mut first).unwrap(), 1);
+        assert_eq!(trove.import_run(&mut first, &mut progress).unwrap(), 1);
 
         let mut second = trove
-            .import_plan(dir2.path(), &ImportOptions::default())
+            .import_plan(dir2.path(), &ImportOptions::default(), &mut progress)
             .unwrap();
         assert_eq!(second.files.len(), 1);
         assert_eq!(second.files[0].state, FileState::Duplicate);
-        assert_eq!(trove.import_run(&mut second).unwrap(), 0);
+        assert_eq!(trove.import_run(&mut second, &mut progress).unwrap(), 0);
         assert_eq!(trove.query(&QuerySpec::new(), false).unwrap().len(), 1);
     }
 
@@ -312,22 +319,24 @@ mod tests {
         )
         .unwrap();
 
+        let mut progress = NoopImportProgress;
         let job = trove
-            .import_plan(dir.path(), &ImportOptions::default())
+            .import_plan(dir.path(), &ImportOptions::default(), &mut progress)
             .unwrap();
         assert_eq!(job.files.len(), 2);
 
-        let partial = trove.import_run_job(&job.id).unwrap();
+        let partial = trove.import_run_job(&job.id, &mut progress).unwrap();
         assert_eq!(partial.files[0].state, FileState::Verified);
         assert_eq!(partial.files[1].state, FileState::Failed);
 
         let mut trove2 =
             Trove::open_with_store(config, home.path(), Box::new(SharedStub(shared))).unwrap();
-        let resumed = trove2.import_resume(&job.id).unwrap();
+        let mut progress2 = NoopImportProgress;
+        let resumed = trove2.import_resume(&job.id, &mut progress2).unwrap();
         assert_eq!(resumed.files[0].state, FileState::Verified);
         assert_eq!(resumed.files[1].state, FileState::Verified);
 
-        let committed = trove2.import_commit_job(&job.id).unwrap();
+        let committed = trove2.import_commit_job(&job.id, &mut progress2).unwrap();
         assert_eq!(committed, 2);
         assert_eq!(trove2.import_status(&job.id).unwrap().stats.committed, 2);
     }

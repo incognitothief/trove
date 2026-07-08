@@ -168,12 +168,13 @@ async fn import(
     Json(body): Json<ImportBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut trove = lock(&state)?;
+    let mut noop = trove_core::NoopImportProgress;
     let options = trove_core::ImportOptions {
         include_dotfiles: trove.config.import.include_dotfiles,
         capture_artwork: trove.config.import.capture_artwork,
     };
     if body.plan_only {
-        let job = trove.import_plan(std::path::Path::new(&body.path), &options)?;
+        let job = trove.import_plan(std::path::Path::new(&body.path), &options, &mut noop)?;
         let stats = job.stats();
         return Ok(Json(json!({
             "job_id": job.id,
@@ -182,7 +183,8 @@ async fn import(
             "artwork_candidates": job.artwork.len(),
         })));
     }
-    let (job, committed) = trove.import_run_full(std::path::Path::new(&body.path), &options)?;
+    let (job, committed) =
+        trove.import_run_full(std::path::Path::new(&body.path), &options, &mut noop)?;
     Ok(Json(json!({
         "job_id": job.id,
         "committed": committed,

@@ -3,6 +3,7 @@
 //! Every subcommand translates flags into a single core call and renders the
 //! result. It contains no reconcile/query/sync logic of its own.
 
+mod import_progress;
 mod runtime;
 
 use anyhow::{Context, Result};
@@ -215,6 +216,13 @@ fn archive(cli: &Cli, cmd: &ArchiveCmd) -> Result<()> {
 
 fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
     let mut trove = runtime::open_trove()?;
+    let mut cli_progress = import_progress::CliImportProgress::new();
+    let mut noop = trove_core::NoopImportProgress;
+    let progress: &mut dyn trove_core::import::ImportProgress = if cli.json {
+        &mut noop
+    } else {
+        &mut cli_progress
+    };
 
     if args.command.is_none() {
         let path = args
@@ -224,7 +232,7 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
         let opts = merge_import_options(&trove, &args.options);
         let source = std::path::Path::new(path);
         let (job, committed) = trove
-            .import_run_full(source, &opts)
+            .import_run_full(source, &opts, progress)
             .with_context(|| format!("importing {path}"))?;
         if cli.json {
             println!(
@@ -250,25 +258,25 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
             let opts = merge_import_options(&trove, options);
             let source = std::path::Path::new(path);
             let job = trove
-                .import_plan(source, &opts)
+                .import_plan(source, &opts, progress)
                 .with_context(|| format!("planning import of {path}"))?;
             print_planned_job(&job, cli.json);
         }
         ImportCmd::Run { job_id } => {
             let job = trove
-                .import_run_job(job_id)
+                .import_run_job(job_id, progress)
                 .with_context(|| format!("running import job {job_id}"))?;
             print_run_result(&job, cli.json);
         }
         ImportCmd::Verify { job_id } => {
             let job = trove
-                .import_verify_job(job_id)
+                .import_verify_job(job_id, progress)
                 .with_context(|| format!("verifying import job {job_id}"))?;
             print_run_result(&job, cli.json);
         }
         ImportCmd::Commit { job_id } => {
             let committed = trove
-                .import_commit_job(job_id)
+                .import_commit_job(job_id, progress)
                 .with_context(|| format!("committing import job {job_id}"))?;
             if cli.json {
                 println!(
@@ -284,7 +292,7 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
         }
         ImportCmd::Resume { job_id } => {
             let job = trove
-                .import_resume(job_id)
+                .import_resume(job_id, progress)
                 .with_context(|| format!("resuming import job {job_id}"))?;
             print_run_result(&job, cli.json);
             if !cli.json {
