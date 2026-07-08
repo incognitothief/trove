@@ -36,7 +36,7 @@ install-ui: ## Install UI (TypeScript/React) dependencies
 ## --- Build ------------------------------------------------------------------
 
 build: ## Build the Rust workspace (core + cli + daemon)
-	$(CARGO) build --workspace
+	$(CARGO) build --workspace $(CARGO_FEATURE_FLAGS)
 
 build-ui: ## Type-check and build the production UI bundle
 	$(NPM) --prefix $(UI) run build
@@ -60,7 +60,7 @@ dev: ## Boot the full stack (pre-builds, waits for readiness, prints addresses)
 CLI_ARGS := $(ARGS) $(filter-out cli,$(MAKECMDGOALS))
 
 cli: ## Run the CLI, e.g. `make cli import /path -- --plan` (or ARGS="query --limit 20")
-	@CARGO="$(CARGO)" bin/trove $(CLI_ARGS)
+	@CARGO="$(CARGO)" CARGO_FEATURES='$(CARGO_FEATURES)' bin/trove $(CLI_ARGS)
 
 # When `cli` is invoked, turn the trailing words into no-op targets so make
 # forwards them as arguments instead of failing with "no rule to make target".
