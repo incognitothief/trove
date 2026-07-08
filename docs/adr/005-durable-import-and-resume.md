@@ -91,6 +91,7 @@ trove import commit <job-id>          # promote to music/ + capture art + push_i
 trove import resume <job-id>          # continue from last safe state
 trove import status <job-id>          # per-phase / per-state counts
 trove import list [--all]             # history of import jobs (id, source, phase, counts, times)
+trove import prune <job-id>           # drop local job bookkeeping (see addendum)
 trove import <path> [--bulk]          # convenience: plan + run + commit, resumable mid-flight
 ```
 
@@ -239,3 +240,98 @@ pass).
   ADR 003); analyzer toolkit; compare-and-swap on `schema-version.json`
   (still ADR 001 follow-up #3); real metadata extraction; volume sync/export
   (ADR 006).
+
+---
+
+## Addendum: Implementation refinements (2026-07-08)
+
+The core ADR 005 surface shipped in the same session. The following
+refinements and bug fixes were discovered during real-library testing and
+are recorded here so operators and future implementers do not have to reverse
+engineer behavior from git history.
+
+### Single-file import
+
+`import plan <path>` and the one-shot `import <path>` now accept **either**
+a directory or a **single audio file**. Previously, scan treated a non-directory
+path as empty, producing jobs with `total_files=0` that could still advance
+through `run` / `commit` without importing anything.
+
+**Operator implication:** a broken pre-fix job stuck at `phase=commit` with
+`files=0` did not touch the archive but still appeared in `import list`. Start
+a new `plan` with the fixed binary; do not `resume` the ghost job.
+
+### Cover art policy (single file vs directory)
+
+Co-located cover capture (ADR 002) applies **by default only to directory
+imports**. When the source is a single audio file, artwork is **not** gathered
+from the file's parent folder — that avoids pulling unrelated images from shared
+folders (e.g. `~/Downloads`).
+
+| Source | Default artwork | Opt-out | Opt-in |
+| ------ | --------------- | ------- | ------ |
+| Directory | Co-located images in each track's parent folder | `--no-artwork` | — |
+| Single file | None | (already off) | `--artwork PATH` |
+
+**`--artwork PATH`** names an explicit image file or folder to scan
+(non-recursive). It does **not** re-enable implicit parent-folder scanning for
+single-file imports. Example:
+
+```bash
+trove import plan Album/01.flac --artwork Album/cover.jpg
+```
+
+Repeatable for multiple paths. Values persist on the job row as `artwork_paths`
+(JSON) so `resume` recreates the same behavior. `--no-artwork` disables the
+automatic directory behavior only; it does not block explicit `--artwork`
+paths.
+
+### Job history and `import prune`
+
+**When a job leaves the default queue (`import list` without `--all`):**
+
+- After `commit` sets `phase=done`, **and**
+- No file rows remain in `failed` state.
+
+Jobs that finished successfully stay in SQLite until pruned; use `import list
+--all` to see them. Jobs with failures remain visible even at `done`.
+
+**`import prune <job-id>`** removes local bookkeeping only: the row in
+`~/.trove/sync.sqlite` (cascades `import_files`) and
+`~/.trove/cache/manifests/<job-id>.json`. It does **not** delete staging or
+canonical bucket objects or undo committed archive entries. Use it to drop
+ghost or abandoned jobs from the operator queue. HTTP mirror: `DELETE
+/import/:id` → `{ "pruned": "<id>" }`.
+
+### Progress output (CLI)
+
+Import steps emit structured progress events (core `ImportProgress` hook).
+Human CLI mode prints line-by-line to stderr:
+
+- `job_id:` is emitted **before** fingerprinting begins (so the id is copyable
+  immediately).
+- Phase headers use **present-tense verbs** for readability:
+  `fingerprinting`, `uploading`, `verifying`, `committing` (via
+  `Phase::progress_label()`). Machine-facing phase strings in status, JSON, and
+  SQLite remain the short nouns (`fingerprint`, `upload`, …).
+
+Fingerprinting persists the job shell and per-file rows incrementally so
+Ctrl+C during plan can be resumed with `import resume` (completes fingerprint
+before upload).
+
+### Schema extensions (additive)
+
+Beyond the columns sketched in §1, live `import_jobs` also stores:
+
+- `artwork_paths TEXT` — JSON array of explicit `--artwork` paths (nullable).
+- `artwork_json TEXT` — serialized artwork candidates after plan.
+- `attempts` on `import_files` — upload retry counter.
+
+Migrations are additive (`ALTER TABLE … ADD COLUMN`) for existing
+`sync.sqlite` files.
+
+### Build / S3 testing note
+
+Real S3 import requires building with the `s3` feature on every invocation,
+e.g. `CARGO_FEATURES=s3 bin/trove …` or `make cli CARGO_FEATURES=s3 …`. The
+Makefile and `bin/trove` wrapper pass `CARGO_FEATURES` through consistently.
