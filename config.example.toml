@@ -27,6 +27,15 @@ playlist_format = "m3u8"
 [mixxx]
 relative_paths = true
 
+# Import behavior (see ADR 002).
+[import]
+# Include dotfiles / hidden directories in scans. Off by default: this skips
+# .DS_Store, AppleDouble ._* sidecars, .Trashes, etc.
+include_dotfiles = false
+# Capture co-located cover art during import. On by default — a durability
+# measure, since folder art lives only on the disposable source device.
+capture_artwork = true
+
 # Named profiles let you point at multiple buckets/regions.
 # [profiles.touring]
 # bucket = "touring-archive"

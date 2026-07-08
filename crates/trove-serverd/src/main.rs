@@ -152,17 +152,26 @@ async fn import(
     Json(body): Json<ImportBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut trove = lock(&state)?;
-    let mut job = trove.import_plan(std::path::Path::new(&body.path))?;
+    let options = trove_core::ImportOptions {
+        include_dotfiles: trove.config.import.include_dotfiles,
+        capture_artwork: trove.config.import.capture_artwork,
+    };
+    let mut job = trove.import_plan(std::path::Path::new(&body.path), &options)?;
     let stats = job.stats();
     if body.plan_only {
         return Ok(Json(json!({
             "job_id": job.id,
             "total": stats.total,
             "duplicates": stats.duplicates,
+            "artwork_candidates": job.artwork.len(),
         })));
     }
     let committed = trove.import_run(&mut job)?;
-    Ok(Json(json!({ "job_id": job.id, "committed": committed })))
+    Ok(Json(json!({
+        "job_id": job.id,
+        "committed": committed,
+        "artwork_captured": job.artwork.len(),
+    })))
 }
 
 fn lock(state: &AppState) -> Result<std::sync::MutexGuard<'_, Trove>, AppError> {

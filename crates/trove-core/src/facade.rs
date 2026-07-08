@@ -14,10 +14,10 @@ use crate::archive::CURRENT_SCHEMA_VERSION;
 use crate::config::Config;
 use crate::db::archive::ArchiveDb;
 use crate::error::Result;
-use crate::import::{self, ImportJob};
+use crate::import::{self, ImportJob, ImportOptions};
 use crate::metadata::{MetadataExtractor, StubExtractor};
 use crate::model::SchemaVersion;
-use crate::model::{ArchiveEntry, Playlist, TrackId};
+use crate::model::{ArchiveEntry, ArtworkRecord, Playlist, TrackId};
 use crate::playlist::PlaylistDb;
 use crate::query::QuerySpec;
 use crate::store::{stub::StubStore, ObjectStore};
@@ -143,13 +143,13 @@ impl Trove {
 
     // --- Import ----------------------------------------------------------
 
-    /// Plan a bulk import (scan + hash + dedupe). Dry-run friendly.
-    pub fn import_plan(&self, source_root: &Path) -> Result<ImportJob> {
-        import::plan(source_root, import::DEFAULT_AUDIO_EXTENSIONS)
+    /// Plan a bulk import (scan + hash + dedupe + gather art). Dry-run friendly.
+    pub fn import_plan(&self, source_root: &Path, options: &ImportOptions) -> Result<ImportJob> {
+        import::plan(source_root, import::DEFAULT_AUDIO_EXTENSIONS, options)
     }
 
-    /// Run a planned import to completion: upload → verify → commit, advancing
-    /// the local archive index only after commit.
+    /// Run a planned import to completion: upload → verify → commit, capture any
+    /// co-located cover art, then advance the canonical index (only after commit).
     pub fn import_run(&mut self, job: &mut ImportJob) -> Result<usize> {
         import::upload(job, self.store.as_ref(), &self.paths)?;
         import::verify(job, self.store.as_ref())?;
@@ -162,9 +162,40 @@ impl Trove {
         for entry in &committed {
             self.archive.upsert(entry)?;
         }
+
+        // Capture co-located cover art while the source is still present, and
+        // record its provenance durably for later curation (ADR 002).
+        let artwork = import::capture_artwork(job, self.store.as_ref(), &self.paths)?;
+        self.append_artwork_manifest(&artwork)?;
+
         // The index only advances after commit; push the new canonical index.
         self.push_index()?;
         Ok(committed.len())
+    }
+
+    /// Merge new artwork provenance records into the durable bucket manifest,
+    /// deduping by (sha256, source_folder).
+    fn append_artwork_manifest(&self, records: &[ArtworkRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let key = self.paths.artwork_manifest();
+        let mut all = match self.store.get(&key) {
+            Ok(bytes) => index::artwork_from_jsonl(&bytes)?,
+            Err(crate::error::Error::NotFound(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let mut seen: std::collections::HashSet<(String, String)> = all
+            .iter()
+            .map(|r| (r.sha256.clone(), r.source_folder.clone()))
+            .collect();
+        for record in records {
+            if seen.insert((record.sha256.clone(), record.source_folder.clone())) {
+                all.push(record.clone());
+            }
+        }
+        self.store.put(&key, &index::artwork_to_jsonl(&all)?)?;
+        Ok(())
     }
 
     /// Push the local archive index up to the bucket as the new canonical

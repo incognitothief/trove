@@ -49,8 +49,21 @@ ui: ## Run the web UI dev server (Vite), proxying /api to the daemon
 dev: ## Boot the full stack (pre-builds, waits for readiness, prints addresses)
 	@SERVERD_ADDR=$(SERVERD_ADDR) bash scripts/dev.sh
 
-cli: ## Run the CLI; pass args with ARGS, e.g. `make cli ARGS="query --limit 20"`
-	$(CARGO) run -p trove-cli -- $(ARGS)
+# Forward everything after `cli` to the CLI. Because make itself parses leading
+# dashes as its own options, put a `--` before any CLI flags, e.g.
+#   make cli import /path/to/music -- --plan
+#   make cli query --limit 20
+# The classic form still works too: make cli ARGS="import /path --plan"
+CLI_ARGS := $(ARGS) $(filter-out cli,$(MAKECMDGOALS))
+
+cli: ## Run the CLI, e.g. `make cli import /path -- --plan` (or ARGS="query --limit 20")
+	@CARGO="$(CARGO)" bin/trove $(CLI_ARGS)
+
+# When `cli` is invoked, turn the trailing words into no-op targets so make
+# forwards them as arguments instead of failing with "no rule to make target".
+ifneq (,$(filter cli,$(MAKECMDGOALS)))
+$(eval $(filter-out cli,$(MAKECMDGOALS)):;@:)
+endif
 
 ## --- Quality ----------------------------------------------------------------
 

@@ -116,6 +116,23 @@ impl VolumeIdentity {
     }
 }
 
+/// A captured cover-art object and its provenance (ADR 002).
+///
+/// Art is captured at import time (folder images live only on the disposable
+/// source), content-addressed for dedup, and logged here so a later curation
+/// analyzer can associate it with albums without needing the source device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtworkRecord {
+    pub sha256: String,
+    /// Content-addressed object key in the bucket (e.g. `artwork/<sha256>.jpg`).
+    pub object_key: String,
+    pub size_bytes: u64,
+    /// Source folder the image was found in (provenance for association).
+    pub source_folder: String,
+    pub file_name: String,
+    pub captured_at: DateTime<Utc>,
+}
+
 /// Reconciliation generation marker (`schema-version.json`), used to decide
 /// whether the local cache is current before serving a read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
