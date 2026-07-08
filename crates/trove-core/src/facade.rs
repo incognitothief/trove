@@ -297,6 +297,15 @@ impl Trove {
         self.import_db.list_jobs(all)
     }
 
+    /// Remove durable import bookkeeping for a job (local only).
+    pub fn import_prune(&self, job_id: &str) -> Result<()> {
+        self.import_db.prune_job(job_id)?;
+        if self.home != Path::new(":memory:") {
+            import::remove_manifest(&self.home, job_id)?;
+        }
+        Ok(())
+    }
+
     /// Convenience one-shot: plan → upload → verify → commit.
     pub fn import_run_full(
         &mut self,

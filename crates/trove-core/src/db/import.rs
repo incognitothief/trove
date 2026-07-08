@@ -71,9 +71,9 @@ impl ImportDb {
         self.conn.execute(
             "INSERT INTO import_jobs (
                 id, source_root, phase, staging_prefix, total_files,
-                include_dotfiles, capture_artwork, artwork_json,
+                include_dotfiles, capture_artwork, artwork_paths, artwork_json,
                 created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, NULL, ?7, ?7)",
+             ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, NULL, ?8, ?8)",
             params![
                 id,
                 source_root.display().to_string(),
@@ -81,6 +81,7 @@ impl ImportDb {
                 staging_prefix,
                 options.include_dotfiles as i32,
                 options.capture_artwork as i32,
+                encode_artwork_paths(&options.artwork_paths),
                 now,
             ],
         )?;
@@ -155,9 +156,9 @@ impl ImportDb {
         tx.execute(
             "INSERT INTO import_jobs (
                 id, source_root, phase, staging_prefix, total_files,
-                include_dotfiles, capture_artwork, artwork_json,
+                include_dotfiles, capture_artwork, artwork_paths, artwork_json,
                 created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 source_root = excluded.source_root,
                 phase = excluded.phase,
@@ -165,6 +166,7 @@ impl ImportDb {
                 total_files = excluded.total_files,
                 include_dotfiles = excluded.include_dotfiles,
                 capture_artwork = excluded.capture_artwork,
+                artwork_paths = excluded.artwork_paths,
                 artwork_json = excluded.artwork_json,
                 updated_at = excluded.updated_at",
             params![
@@ -175,6 +177,7 @@ impl ImportDb {
                 job.files.len() as i64,
                 options.include_dotfiles as i32,
                 options.capture_artwork as i32,
+                encode_artwork_paths(&options.artwork_paths),
                 artwork_json,
                 created_at,
                 now,
@@ -196,7 +199,7 @@ impl ImportDb {
         let row = self
             .conn
             .query_row(
-                "SELECT source_root, phase, staging_prefix, include_dotfiles, capture_artwork, artwork_json
+                "SELECT source_root, phase, staging_prefix, include_dotfiles, capture_artwork, artwork_paths, artwork_json
                  FROM import_jobs WHERE id = ?1",
                 params![id],
                 |r| {
@@ -207,6 +210,7 @@ impl ImportDb {
                         r.get::<_, i32>(3)? != 0,
                         r.get::<_, i32>(4)? != 0,
                         r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
@@ -218,6 +222,7 @@ impl ImportDb {
             staging_prefix,
             include_dotfiles,
             capture_artwork,
+            artwork_paths_json,
             artwork_json,
         ) = row;
         let phase = Phase::parse(&phase_str)
@@ -229,6 +234,7 @@ impl ImportDb {
         let options = ImportOptions {
             include_dotfiles,
             capture_artwork,
+            artwork_paths: decode_artwork_paths(artwork_paths_json)?,
         };
 
         let mut stmt = self.conn.prepare(
@@ -268,6 +274,17 @@ impl ImportDb {
             "UPDATE import_jobs SET phase = ?1, updated_at = ?2 WHERE id = ?3",
             params![phase.as_str(), Utc::now().to_rfc3339(), job_id],
         )?;
+        Ok(())
+    }
+
+    /// Remove a job and its file rows from durable bookkeeping.
+    pub fn prune_job(&self, job_id: &str) -> Result<()> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM import_jobs WHERE id = ?1", params![job_id])?;
+        if deleted == 0 {
+            return Err(Error::not_found(format!("import job '{job_id}'")));
+        }
         Ok(())
     }
 
@@ -448,6 +465,7 @@ fn migrate_import_schema(conn: &Connection) -> Result<()> {
         "capture_artwork",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
+    ensure_column(conn, "import_jobs", "artwork_paths", "TEXT")?;
     ensure_column(conn, "import_jobs", "artwork_json", "TEXT")?;
     ensure_column(conn, "import_files", "track_id", "TEXT")?;
     ensure_column(
@@ -457,6 +475,32 @@ fn migrate_import_schema(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     Ok(())
+}
+
+fn encode_artwork_paths(paths: &[PathBuf]) -> Option<String> {
+    if paths.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string(
+                &paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("artwork paths serialize"),
+        )
+    }
+}
+
+fn decode_artwork_paths(json: Option<String>) -> Result<Vec<PathBuf>> {
+    match json {
+        None => Ok(Vec::new()),
+        Some(raw) => {
+            let strings: Vec<String> = serde_json::from_str(&raw)?;
+            Ok(strings.into_iter().map(PathBuf::from).collect())
+        }
+    }
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {

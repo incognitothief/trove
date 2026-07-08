@@ -8,6 +8,7 @@ mod runtime;
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 use trove_core::model::TrackId;
 use trove_core::query::{QuerySpec, Range};
 
@@ -95,6 +96,8 @@ enum ImportCmd {
         #[arg(long)]
         all: bool,
     },
+    /// Drop local import job state (sync.sqlite + manifest). Does not delete bucket objects.
+    Prune { job_id: String },
 }
 
 #[derive(Args, Default)]
@@ -102,9 +105,12 @@ struct ImportOptionsArgs {
     /// Include dotfiles / hidden directories (excluded by default).
     #[arg(long)]
     include_dotfiles: bool,
-    /// Do not capture co-located cover art (captured by default).
+    /// Do not capture co-located cover art (captured by default for directories).
     #[arg(long)]
     no_artwork: bool,
+    /// Cover-art image or folder to import (`--artwork cover.jpg`).
+    #[arg(long, value_name = "PATH")]
+    artwork: Vec<PathBuf>,
 }
 
 #[derive(Args)]
@@ -338,6 +344,21 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
                 }
             }
         }
+        ImportCmd::Prune { job_id } => {
+            trove
+                .import_prune(job_id)
+                .with_context(|| format!("pruning import job {job_id}"))?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "pruned": job_id,
+                    }))?
+                );
+            } else {
+                println!("pruned import job {job_id}");
+            }
+        }
     }
     Ok(())
 }
@@ -349,6 +370,7 @@ fn merge_import_options(
     trove_core::ImportOptions {
         include_dotfiles: trove.config.import.include_dotfiles || args.include_dotfiles,
         capture_artwork: trove.config.import.capture_artwork && !args.no_artwork,
+        artwork_paths: args.artwork.clone(),
     }
 }
 

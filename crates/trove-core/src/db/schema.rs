@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS import_jobs (
     total_files      INTEGER NOT NULL DEFAULT 0,
     include_dotfiles INTEGER NOT NULL DEFAULT 0,
     capture_artwork  INTEGER NOT NULL DEFAULT 1,
+    artwork_paths    TEXT,
     artwork_json     TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL

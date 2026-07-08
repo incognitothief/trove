@@ -47,6 +47,19 @@ impl Phase {
             Phase::Done => "done",
         }
     }
+
+    /// Present-tense verb for human progress output (CLI headers).
+    pub fn progress_label(&self) -> &'static str {
+        match self {
+            Phase::Scan => "scanning",
+            Phase::Fingerprint => "fingerprinting",
+            Phase::Dedupe => "deduping",
+            Phase::Upload => "uploading",
+            Phase::Verify => "verifying",
+            Phase::Commit => "committing",
+            Phase::Done => "done",
+        }
+    }
 }
 
 impl fmt::Display for Phase {

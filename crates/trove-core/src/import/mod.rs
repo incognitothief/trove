@@ -31,12 +31,14 @@ pub use progress::{
 pub use state::{FileState, Phase};
 
 /// Options controlling scan-time import behavior (ADR 002).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ImportOptions {
     /// Include dotfiles / hidden directories (default: exclude them).
     pub include_dotfiles: bool,
-    /// Capture co-located cover art (default: on — a durability measure).
+    /// Capture co-located cover art for directory imports (default: on).
     pub capture_artwork: bool,
+    /// Explicit cover-art image files or folders (`--artwork PATH`).
+    pub artwork_paths: Vec<PathBuf>,
 }
 
 impl Default for ImportOptions {
@@ -44,6 +46,7 @@ impl Default for ImportOptions {
         ImportOptions {
             include_dotfiles: false,
             capture_artwork: true,
+            artwork_paths: Vec::new(),
         }
     }
 }
@@ -178,7 +181,7 @@ pub fn plan(
     }
 
     let mut discovered = Vec::new();
-    scan_dir(
+    discover_audio(
         &source_root,
         extensions,
         options.include_dotfiles,
@@ -255,11 +258,19 @@ pub fn plan(
 
     progress.phase_done(Phase::Dedupe, done, total);
 
-    let artwork = if options.capture_artwork {
+    // Directory imports gather co-located artwork by default. Explicit paths
+    // (`--artwork PATH`) add image files or scan folders you name directly.
+    let mut artwork = if options.capture_artwork && source_root.is_dir() {
         gather_artwork(&discovered, options.include_dotfiles)?
     } else {
         Vec::new()
     };
+    if !options.artwork_paths.is_empty() {
+        merge_artwork(
+            &mut artwork,
+            gather_artwork_from_paths(&options.artwork_paths, options.include_dotfiles)?,
+        );
+    }
 
     if let Some(db) = db {
         db.update_phase(&id, Phase::Dedupe)?;
@@ -332,7 +343,7 @@ pub fn refresh_changed_files(job: &mut ImportJob) -> Result<()> {
     Ok(())
 }
 
-/// Collect co-located cover-art candidates.
+/// Collect co-located cover-art candidates next to discovered audio.
 fn gather_artwork(
     audio_paths: &[PathBuf],
     include_dotfiles: bool,
@@ -347,30 +358,102 @@ fn gather_artwork(
     let mut candidates = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
     for folder in folders {
-        for entry in std::fs::read_dir(&folder)? {
-            let path = entry?.path();
-            if !path.is_file() || is_hidden(&path, include_dotfiles) {
+        gather_artwork_in_folder(&folder, include_dotfiles, &mut candidates, &mut seen)?;
+    }
+    Ok(candidates)
+}
+
+/// Collect cover-art from explicit `--artwork` paths (image file or folder).
+fn gather_artwork_from_paths(
+    paths: &[PathBuf],
+    include_dotfiles: bool,
+) -> Result<Vec<ArtworkCandidate>> {
+    let mut candidates = Vec::new();
+    let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for path in paths {
+        if !path.exists() {
+            return Err(Error::Other(format!(
+                "artwork path not found: {}",
+                path.display()
+            )));
+        }
+        if path.is_file() {
+            if is_hidden(path, include_dotfiles) {
                 continue;
             }
-            if !is_image(&path, DEFAULT_IMAGE_EXTENSIONS) {
-                continue;
+            if !is_image(path, DEFAULT_IMAGE_EXTENSIONS) {
+                return Err(Error::Other(format!(
+                    "artwork path is not an image: {}",
+                    path.display()
+                )));
             }
-            let bytes = std::fs::read(&path)?;
-            let sha256 = hash_bytes(&bytes);
-            let source_folder = folder.display().to_string();
-            if !seen.insert((sha256.clone(), source_folder.clone())) {
-                continue;
-            }
-            candidates.push(ArtworkCandidate {
-                path: path.clone(),
-                sha256,
-                size: bytes.len() as u64,
-                source_folder,
-                object_key: None,
-            });
+            push_artwork_file(path, path.parent(), &mut candidates, &mut seen)?;
+        } else if path.is_dir() {
+            gather_artwork_in_folder(path, include_dotfiles, &mut candidates, &mut seen)?;
+        } else {
+            return Err(Error::Other(format!(
+                "artwork path is not a file or directory: {}",
+                path.display()
+            )));
         }
     }
     Ok(candidates)
+}
+
+fn gather_artwork_in_folder(
+    folder: &Path,
+    include_dotfiles: bool,
+    candidates: &mut Vec<ArtworkCandidate>,
+    seen: &mut std::collections::HashSet<(String, String)>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(folder)? {
+        let path = entry?.path();
+        if !path.is_file() || is_hidden(&path, include_dotfiles) {
+            continue;
+        }
+        if !is_image(&path, DEFAULT_IMAGE_EXTENSIONS) {
+            continue;
+        }
+        push_artwork_file(&path, Some(folder), candidates, seen)?;
+    }
+    Ok(())
+}
+
+fn push_artwork_file(
+    path: &Path,
+    source_folder: Option<&Path>,
+    candidates: &mut Vec<ArtworkCandidate>,
+    seen: &mut std::collections::HashSet<(String, String)>,
+) -> Result<()> {
+    let bytes = std::fs::read(path)?;
+    let sha256 = hash_bytes(&bytes);
+    let source_folder = source_folder
+        .unwrap_or_else(|| path.parent().unwrap_or(Path::new("")))
+        .display()
+        .to_string();
+    if !seen.insert((sha256.clone(), source_folder.clone())) {
+        return Ok(());
+    }
+    candidates.push(ArtworkCandidate {
+        path: path.to_path_buf(),
+        sha256,
+        size: bytes.len() as u64,
+        source_folder,
+        object_key: None,
+    });
+    Ok(())
+}
+
+fn merge_artwork(into: &mut Vec<ArtworkCandidate>, more: Vec<ArtworkCandidate>) {
+    let mut seen: std::collections::HashSet<(String, String)> = into
+        .iter()
+        .map(|c| (c.sha256.clone(), c.source_folder.clone()))
+        .collect();
+    for candidate in more {
+        if seen.insert((candidate.sha256.clone(), candidate.source_folder.clone())) {
+            into.push(candidate);
+        }
+    }
 }
 
 /// Capture artwork candidates into the content-addressed `artwork/` namespace.
@@ -672,6 +755,15 @@ pub fn write_manifest(home: &Path, job: &ImportJob) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Remove the local manifest for a pruned import job.
+pub fn remove_manifest(home: &Path, job_id: &str) -> Result<()> {
+    let path = home.join("cache/manifests").join(format!("{job_id}.json"));
+    if path.is_file() {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 fn persist_file(db: Option<&ImportDb>, job_id: &str, file: &PlannedFile) -> Result<()> {
     if let Some(db) = db {
         db.update_file(job_id, file)?;
@@ -713,6 +805,31 @@ fn format_mtime(t: std::time::SystemTime) -> String {
     use std::time::UNIX_EPOCH;
     let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
     format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
+}
+
+/// Discover importable audio under `source`, which may be a directory or a single file.
+fn discover_audio(
+    source: &Path,
+    extensions: &[&str],
+    include_dotfiles: bool,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if source.is_dir() {
+        scan_dir(source, extensions, include_dotfiles, out)
+    } else if source.is_file() {
+        if is_hidden(source, include_dotfiles) {
+            return Ok(());
+        }
+        if is_audio(source, extensions) {
+            out.push(source.to_path_buf());
+        }
+        Ok(())
+    } else {
+        Err(Error::not_found(format!(
+            "import source not found: {}",
+            source.display()
+        )))
+    }
 }
 
 fn scan_dir(

@@ -28,7 +28,7 @@ impl ImportProgress for CliImportProgress {
                 let _ = writeln!(
                     io::stderr(),
                     "{}: {} file(s)",
-                    event.phase,
+                    event.phase.progress_label(),
                     event.files_total
                 );
             }

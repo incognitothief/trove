@@ -196,8 +196,8 @@ mod tests {
             dir.path(),
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
             &ImportOptions {
-                include_dotfiles: false,
                 capture_artwork: false,
+                ..Default::default()
             },
             None,
             None,
@@ -206,6 +206,83 @@ mod tests {
         )
         .unwrap();
         assert!(no_art.artwork.is_empty());
+    }
+
+    #[test]
+    fn import_plan_accepts_single_audio_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let track = dir.path().join("01 Moth Love.aiff");
+        std::fs::write(&track, b"audio-bytes").unwrap();
+
+        let mut progress = NoopImportProgress;
+        let job = crate::import::plan(
+            &track,
+            crate::import::DEFAULT_AUDIO_EXTENSIONS,
+            &ImportOptions::default(),
+            None,
+            None,
+            None,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(job.files.len(), 1);
+        assert_eq!(job.source_root, track);
+        assert_eq!(job.files[0].path, track);
+    }
+
+    #[test]
+    fn import_single_file_skips_co_located_artwork() {
+        let dir = tempfile::tempdir().unwrap();
+        let album = dir.path().join("Album");
+        std::fs::create_dir_all(&album).unwrap();
+        let track = album.join("01 Moth Love.aiff");
+        std::fs::write(&track, b"audio-bytes").unwrap();
+        std::fs::write(album.join("cover.jpg"), b"JPEGDATA").unwrap();
+
+        let mut progress = NoopImportProgress;
+        let job = crate::import::plan(
+            &track,
+            crate::import::DEFAULT_AUDIO_EXTENSIONS,
+            &ImportOptions::default(),
+            None,
+            None,
+            None,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(job.files.len(), 1);
+        assert!(
+            job.artwork.is_empty(),
+            "single-file import should not gather folder artwork"
+        );
+
+        let with_art = crate::import::plan(
+            &track,
+            crate::import::DEFAULT_AUDIO_EXTENSIONS,
+            &ImportOptions {
+                artwork_paths: vec![album.join("cover.jpg")],
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(with_art.artwork.len(), 1);
+        assert_eq!(with_art.artwork[0].path, album.join("cover.jpg"));
+
+        let folder_job = crate::import::plan(
+            &album,
+            crate::import::DEFAULT_AUDIO_EXTENSIONS,
+            &ImportOptions::default(),
+            None,
+            None,
+            None,
+            &mut progress,
+        )
+        .unwrap();
+        assert_eq!(folder_job.artwork.len(), 1);
     }
 
     #[test]
@@ -430,5 +507,25 @@ mod tests {
             .playlist_remove("tonight", &TrackId::from("a"))
             .unwrap();
         assert_eq!(trove.playlist_get("tonight").unwrap().track_ids.len(), 1);
+    }
+
+    #[test]
+    fn import_prune_drops_durable_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let db = crate::db::import::ImportDb::open(&home.path().join("sync.sqlite")).unwrap();
+        let id = "ghost-job";
+        db.create_job_shell(
+            id,
+            dir.path(),
+            "staging/ghost-job",
+            &ImportOptions::default(),
+        )
+        .unwrap();
+        assert!(db.load_job(id).is_ok());
+
+        db.prune_job(id).unwrap();
+        assert!(db.load_job(id).is_err());
+        assert!(db.list_jobs(true).unwrap().is_empty());
     }
 }
