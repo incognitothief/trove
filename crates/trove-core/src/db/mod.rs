@@ -5,6 +5,7 @@
 //! `~/.trove` rebuilds itself on demand.
 
 pub mod archive;
+pub mod import;
 pub mod schema;
 
 use std::path::Path;

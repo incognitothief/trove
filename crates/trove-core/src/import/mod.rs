@@ -1,25 +1,25 @@
 //! Bulk import: resumable, crash-safe migration of a local library into the
 //! bucket (ADR "Initial archive backfill").
 //!
-//! The bootstrap implements the full phase pipeline against the [`ObjectStore`]
-//! abstraction (so it runs end-to-end against the stub store): scan and hash on
-//! disk, dedupe by content hash, upload to a per-job staging prefix, verify,
-//! then commit into the canonical `music/` namespace and the archive index.
-//! Canonical audio keys are content-addressed (`music/<sha256>.<ext>`, ADR 004).
-//! Wiring to persistent `import_files` bookkeeping and multipart uploads is the
-//! next step; the state machine and object layout are already in place.
+//! Import state persists to `~/.trove/sync.sqlite` (ADR 005) so a crash mid-job
+//! resumes without rescanning or rehashing finished files. Canonical audio keys
+//! are content-addressed (`music/<sha256>.<ext>`, ADR 004).
 
 pub mod state;
 
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::archive::index::BucketPaths;
 use crate::db::archive::ArchiveDb;
-use crate::error::Result;
+use crate::db::import::ImportDb;
+use crate::error::{Error, Result};
 use crate::metadata::MetadataExtractor;
 use crate::model::{ArchiveEntry, ArtworkRecord, TrackId};
 use crate::store::ObjectStore;
@@ -49,10 +49,14 @@ impl Default for ImportOptions {
 pub struct PlannedFile {
     pub path: PathBuf,
     pub size: u64,
+    pub mtime: Option<String>,
     pub sha256: String,
     pub state: FileState,
     pub object_key: Option<String>,
     pub track_id: Option<TrackId>,
+    pub etag: Option<String>,
+    pub error: Option<String>,
+    pub attempts: u32,
 }
 
 /// A cover-art image found next to imported audio, captured for durability.
@@ -96,7 +100,7 @@ impl ImportJob {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ImportStats {
     pub total: usize,
     pub duplicates: usize,
@@ -106,10 +110,28 @@ pub struct ImportStats {
     pub failed: usize,
 }
 
+/// Machine-readable import manifest written under `~/.trove/cache/manifests/`.
+#[derive(Debug, Serialize)]
+pub struct ImportManifest {
+    pub job_id: String,
+    pub source_root: PathBuf,
+    pub phase: Phase,
+    pub files: Vec<ImportManifestFile>,
+    pub written_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportManifestFile {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub state: FileState,
+    pub object_key: Option<String>,
+}
+
+const MAX_STORE_ATTEMPTS: u32 = 5;
+
 /// Plan a bulk import: scan `source_root`, hash each audio file, dedupe by
-/// content hash, and (per options) gather co-located cover art. Produces a job
-/// with per-file state populated up to `hashed` (or `duplicate`). This is the
-/// dry-run-friendly phase.
+/// content hash, and (per options) gather co-located cover art.
 pub fn plan(
     source_root: &Path,
     extensions: &[&str],
@@ -130,8 +152,10 @@ pub fn plan(
     discovered.sort();
 
     for path in &discovered {
+        let meta = std::fs::metadata(path)?;
+        let size = meta.len();
+        let mtime = file_mtime_from_meta(&meta);
         let bytes = std::fs::read(path)?;
-        let size = bytes.len() as u64;
         let sha256 = hash_bytes(&bytes);
         let already_in_archive = match archive {
             Some(db) => db.find_by_sha256(&sha256)?.is_some(),
@@ -145,10 +169,14 @@ pub fn plan(
         files.push(PlannedFile {
             path: path.clone(),
             size,
+            mtime,
             sha256,
             state,
             object_key: None,
             track_id: None,
+            etag: None,
+            error: None,
+            attempts: 0,
         });
     }
 
@@ -168,8 +196,51 @@ pub fn plan(
     })
 }
 
-/// Collect co-located cover-art candidates: image files sharing a folder with at
-/// least one imported audio file. Content-addressed so identical covers dedupe.
+/// Reset incomplete upload states so resume can retry safely.
+pub fn prepare_for_resume(job: &mut ImportJob) {
+    for file in job.files.iter_mut() {
+        match file.state {
+            FileState::Uploading | FileState::Failed => {
+                file.state = FileState::Hashed;
+                file.error = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Re-hash files whose on-disk size/mtime changed since the last plan.
+pub fn refresh_changed_files(job: &mut ImportJob) -> Result<()> {
+    for file in job.files.iter_mut() {
+        if file.state == FileState::Duplicate || file.state == FileState::Committed {
+            continue;
+        }
+        if file.sha256.is_empty() {
+            continue;
+        }
+        let meta = match std::fs::metadata(&file.path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let size = meta.len();
+        let mtime = file_mtime_from_meta(&meta);
+        if file.size == size && file.mtime == mtime {
+            continue;
+        }
+        let bytes = std::fs::read(&file.path)?;
+        file.size = size;
+        file.mtime = mtime;
+        file.sha256 = hash_bytes(&bytes);
+        file.state = FileState::Hashed;
+        file.object_key = None;
+        file.etag = None;
+        file.error = None;
+        file.attempts = 0;
+    }
+    Ok(())
+}
+
+/// Collect co-located cover-art candidates.
 fn gather_artwork(
     audio_paths: &[PathBuf],
     include_dotfiles: bool,
@@ -210,9 +281,7 @@ fn gather_artwork(
     Ok(candidates)
 }
 
-/// Capture artwork candidates into the content-addressed `artwork/` namespace
-/// and return provenance records for the durable manifest. Idempotent: an
-/// already-present art object is not re-uploaded.
+/// Capture artwork candidates into the content-addressed `artwork/` namespace.
 pub fn capture_artwork(
     job: &mut ImportJob,
     store: &dyn ObjectStore,
@@ -250,52 +319,118 @@ pub fn capture_artwork(
 }
 
 /// Upload all non-duplicate files to the per-job staging prefix.
-pub fn upload(job: &mut ImportJob, store: &dyn ObjectStore, paths: &BucketPaths) -> Result<()> {
+pub fn upload(
+    job: &mut ImportJob,
+    store: &dyn ObjectStore,
+    paths: &BucketPaths,
+    db: Option<&ImportDb>,
+) -> Result<()> {
+    job.phase = Phase::Upload;
+    if let Some(db) = db {
+        db.update_phase(&job.id, job.phase)?;
+    }
+
     for file in job.files.iter_mut() {
-        if file.state != FileState::Hashed {
+        if !matches!(file.state, FileState::Hashed) {
             continue;
         }
         file.state = FileState::Uploading;
+        persist_file(db, &job.id, file)?;
+
         let bytes = std::fs::read(&file.path)?;
         let rel = staging_relative(&file.sha256, &file.path);
         let key = format!("{}/{}", paths.staging(&job.id), rel);
-        store.put(&key, &bytes)?;
-        file.object_key = Some(key);
-        file.state = FileState::Uploaded;
+
+        let meta = retry_store(|| store.put(&key, &bytes), &mut file.attempts);
+        match meta {
+            Ok(meta) => {
+                file.object_key = Some(meta.key);
+                file.etag = meta.etag;
+                file.state = FileState::Uploaded;
+                file.error = None;
+            }
+            Err(e) => {
+                file.state = FileState::Failed;
+                file.error = Some(e.to_string());
+            }
+        }
+        persist_file(db, &job.id, file)?;
     }
+
     job.phase = Phase::Verify;
+    if let Some(db) = db {
+        db.update_phase(&job.id, job.phase)?;
+    }
     Ok(())
 }
 
 /// Verify uploaded objects by size (and presence) before commit.
-pub fn verify(job: &mut ImportJob, store: &dyn ObjectStore) -> Result<()> {
+pub fn verify(job: &mut ImportJob, store: &dyn ObjectStore, db: Option<&ImportDb>) -> Result<()> {
+    job.phase = Phase::Verify;
+    if let Some(db) = db {
+        db.update_phase(&job.id, job.phase)?;
+    }
+
     for file in job.files.iter_mut() {
         if file.state != FileState::Uploaded {
             continue;
         }
-        let key = file
-            .object_key
-            .as_ref()
-            .expect("uploaded file must have an object key");
-        match store.head(key)? {
-            Some(meta) if meta.size_bytes == file.size => file.state = FileState::Verified,
-            _ => file.state = FileState::Failed,
+        let key = match file.object_key.as_ref() {
+            Some(k) => k.clone(),
+            None => {
+                file.state = FileState::Failed;
+                file.error = Some("uploaded file missing object key".into());
+                persist_file(db, &job.id, file)?;
+                continue;
+            }
+        };
+
+        let verify_result = retry_store(
+            || match store.head(&key)? {
+                Some(meta) if meta.size_bytes == file.size => Ok(()),
+                Some(meta) => Err(Error::store(format!(
+                    "size mismatch for {key}: expected {} got {}",
+                    file.size, meta.size_bytes
+                ))),
+                None => Err(Error::not_found(key.clone())),
+            },
+            &mut file.attempts,
+        );
+
+        match verify_result {
+            Ok(()) => {
+                file.state = FileState::Verified;
+                file.error = None;
+            }
+            Err(e) => {
+                file.state = FileState::Failed;
+                file.error = Some(e.to_string());
+            }
         }
+        persist_file(db, &job.id, file)?;
     }
+
     job.phase = Phase::Commit;
+    if let Some(db) = db {
+        db.update_phase(&job.id, job.phase)?;
+    }
     Ok(())
 }
 
 /// Promote verified staging objects into `music/` and produce archive entries.
-///
-/// Commit is always the last step: only verified objects advance the index.
 pub fn commit(
     job: &mut ImportJob,
     store: &dyn ObjectStore,
     paths: &BucketPaths,
     archive: &ArchiveDb,
     extractor: &dyn MetadataExtractor,
+    db: Option<&ImportDb>,
 ) -> Result<Vec<ArchiveEntry>> {
+    job.phase = Phase::Commit;
+    if let Some(db) = db {
+        db.update_phase(&job.id, job.phase)?;
+    }
+
     let mut committed = Vec::new();
     for file in job.files.iter_mut() {
         if file.state != FileState::Verified {
@@ -306,6 +441,7 @@ pub fn commit(
             file.object_key = Some(existing.object_key.clone());
             file.track_id = Some(existing.track_id.clone());
             file.state = FileState::Duplicate;
+            persist_file(db, &job.id, file)?;
             continue;
         }
 
@@ -316,8 +452,22 @@ pub fn commit(
             .clone();
         let rel = canonical_music_relative(&file.sha256, &file.path);
         let music_key = paths.music(&rel);
-        if !store.exists(&music_key)? {
-            store.copy(&staging_key, &music_key)?;
+
+        let copy_result = retry_store(
+            || {
+                if !store.exists(&music_key)? {
+                    store.copy(&staging_key, &music_key)?;
+                }
+                Ok(())
+            },
+            &mut file.attempts,
+        );
+
+        if let Err(e) = copy_result {
+            file.state = FileState::Failed;
+            file.error = Some(e.to_string());
+            persist_file(db, &job.id, file)?;
+            continue;
         }
 
         let track_id = TrackId::new();
@@ -339,9 +489,83 @@ pub fn commit(
         file.object_key = Some(music_key);
         file.track_id = Some(track_id);
         file.state = FileState::Committed;
+        persist_file(db, &job.id, file)?;
     }
+
     job.phase = Phase::Done;
+    if let Some(db) = db {
+        db.update_phase(&job.id, job.phase)?;
+    }
     Ok(committed)
+}
+
+/// Write a machine-readable manifest for operator inspection.
+pub fn write_manifest(home: &Path, job: &ImportJob) -> Result<PathBuf> {
+    let dir = home.join("cache/manifests");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", job.id));
+    let manifest = ImportManifest {
+        job_id: job.id.clone(),
+        source_root: job.source_root.clone(),
+        phase: job.phase,
+        files: job
+            .files
+            .iter()
+            .map(|f| ImportManifestFile {
+                path: f.path.clone(),
+                sha256: f.sha256.clone(),
+                state: f.state,
+                object_key: f.object_key.clone(),
+            })
+            .collect(),
+        written_at: Utc::now(),
+    };
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    std::fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+fn persist_file(db: Option<&ImportDb>, job_id: &str, file: &PlannedFile) -> Result<()> {
+    if let Some(db) = db {
+        db.update_file(job_id, file)?;
+    }
+    Ok(())
+}
+
+fn retry_store<F, T>(mut op: F, attempts: &mut u32) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    const BASE_MS: u64 = 500;
+    const MAX_MS: u64 = 30_000;
+
+    loop {
+        *attempts += 1;
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if *attempts >= MAX_STORE_ATTEMPTS || !is_transient(&e) => return Err(e),
+            Err(_) => {
+                let exp = (*attempts - 1).min(6);
+                let delay = (BASE_MS.saturating_mul(1 << exp)).min(MAX_MS);
+                let jitter = delay / 4;
+                thread::sleep(Duration::from_millis(delay + jitter));
+            }
+        }
+    }
+}
+
+fn is_transient(err: &Error) -> bool {
+    matches!(err, Error::Store(_) | Error::Io(_))
+}
+
+fn file_mtime_from_meta(meta: &std::fs::Metadata) -> Option<String> {
+    meta.modified().ok().map(format_mtime)
+}
+
+fn format_mtime(t: std::time::SystemTime) -> String {
+    use std::time::UNIX_EPOCH;
+    let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
+    format!("{}.{:09}", d.as_secs(), d.subsec_nanos())
 }
 
 fn scan_dir(
@@ -367,8 +591,6 @@ fn scan_dir(
     Ok(())
 }
 
-/// Whether a path should be skipped as hidden. Always false when dotfiles are
-/// explicitly included.
 fn is_hidden(path: &Path, include_dotfiles: bool) -> bool {
     if include_dotfiles {
         return false;
@@ -434,5 +656,46 @@ mod tests {
     fn canonical_music_relative_uses_hash_and_extension() {
         let path = Path::new("/music/Artist/Album/01 - Intro.mp3");
         assert_eq!(canonical_music_relative("abc123", path), "abc123.mp3");
+    }
+
+    #[test]
+    fn prepare_for_resume_resets_uploading_and_failed() {
+        let mut job = ImportJob {
+            id: "j".into(),
+            source_root: PathBuf::from("/src"),
+            staging_prefix: "staging/j".into(),
+            phase: Phase::Upload,
+            files: vec![
+                PlannedFile {
+                    path: PathBuf::from("/src/a.mp3"),
+                    size: 1,
+                    mtime: None,
+                    sha256: "a".into(),
+                    state: FileState::Uploading,
+                    object_key: None,
+                    track_id: None,
+                    etag: None,
+                    error: Some("timeout".into()),
+                    attempts: 2,
+                },
+                PlannedFile {
+                    path: PathBuf::from("/src/b.mp3"),
+                    size: 1,
+                    mtime: None,
+                    sha256: "b".into(),
+                    state: FileState::Uploaded,
+                    object_key: Some("k".into()),
+                    track_id: None,
+                    etag: None,
+                    error: None,
+                    attempts: 0,
+                },
+            ],
+            artwork: Vec::new(),
+        };
+        prepare_for_resume(&mut job);
+        assert_eq!(job.files[0].state, FileState::Hashed);
+        assert!(job.files[0].error.is_none());
+        assert_eq!(job.files[1].state, FileState::Uploaded);
     }
 }

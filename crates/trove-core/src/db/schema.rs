@@ -90,13 +90,16 @@ CREATE TABLE IF NOT EXISTS transfers (
 );
 
 CREATE TABLE IF NOT EXISTS import_jobs (
-    id             TEXT PRIMARY KEY,
-    source_root    TEXT NOT NULL,
-    phase          TEXT NOT NULL,       -- scan|fingerprint|dedupe|upload|verify|commit|done
-    staging_prefix TEXT NOT NULL,
-    total_files    INTEGER NOT NULL DEFAULT 0,
-    created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    id               TEXT PRIMARY KEY,
+    source_root      TEXT NOT NULL,
+    phase            TEXT NOT NULL,       -- scan|fingerprint|dedupe|upload|verify|commit|done
+    staging_prefix   TEXT NOT NULL,
+    total_files      INTEGER NOT NULL DEFAULT 0,
+    include_dotfiles INTEGER NOT NULL DEFAULT 0,
+    capture_artwork  INTEGER NOT NULL DEFAULT 1,
+    artwork_json     TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS import_files (
@@ -108,8 +111,10 @@ CREATE TABLE IF NOT EXISTS import_files (
     metadata_extracted INTEGER NOT NULL DEFAULT 0,
     state              TEXT NOT NULL,   -- see import::state::FileState
     s3_object_key      TEXT,
+    track_id           TEXT,
     etag               TEXT,
     error              TEXT,
+    attempts           INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (job_id, path)
 );
 "#;

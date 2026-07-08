@@ -61,17 +61,43 @@ enum ArchiveCmd {
 
 #[derive(Args)]
 struct ImportArgs {
-    /// Source folder to import.
-    path: String,
-    /// Only scan/hash/dedupe and print a plan (no upload).
-    #[arg(long)]
-    plan: bool,
-    /// Treat as a resumable bulk migration.
-    #[arg(long)]
-    bulk: bool,
-    /// Resume a previously interrupted job.
-    #[arg(long)]
-    resume: bool,
+    #[command(subcommand)]
+    command: Option<ImportCmd>,
+    /// Source folder for one-shot import when no subcommand is given.
+    #[arg(value_name = "PATH")]
+    path: Option<String>,
+    #[command(flatten)]
+    options: ImportOptionsArgs,
+}
+
+#[derive(Subcommand)]
+enum ImportCmd {
+    /// Scan/hash/dedupe and persist a job (dry-run friendly).
+    Plan {
+        path: String,
+        #[command(flatten)]
+        options: ImportOptionsArgs,
+    },
+    /// Upload + verify staged objects (no commit).
+    Run { job_id: String },
+    /// Re-verify staged objects.
+    Verify { job_id: String },
+    /// Promote verified objects and advance the archive index.
+    Commit { job_id: String },
+    /// Continue upload + verify from the last safe state.
+    Resume { job_id: String },
+    /// Per-phase / per-state counts for a job.
+    Status { job_id: String },
+    /// List import jobs (incomplete by default).
+    List {
+        /// Include finished jobs.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Args, Default)]
+struct ImportOptionsArgs {
     /// Include dotfiles / hidden directories (excluded by default).
     #[arg(long)]
     include_dotfiles: bool,
@@ -187,19 +213,157 @@ fn archive(cli: &Cli, cmd: &ArchiveCmd) -> Result<()> {
     Ok(())
 }
 
-fn import(_cli: &Cli, args: &ImportArgs) -> Result<()> {
+fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
     let mut trove = runtime::open_trove()?;
-    // Start from configured defaults, then apply command-line overrides.
-    let options = trove_core::ImportOptions {
+
+    if args.command.is_none() {
+        let path = args
+            .path
+            .as_deref()
+            .context("import requires a source path or subcommand")?;
+        let opts = merge_import_options(&trove, &args.options);
+        let source = std::path::Path::new(path);
+        let (job, committed) = trove
+            .import_run_full(source, &opts)
+            .with_context(|| format!("importing {path}"))?;
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "job_id": job.id,
+                    "committed": committed,
+                    "artwork_captured": job.artwork.len(),
+                }))?
+            );
+        } else {
+            println!(
+                "job {}: committed {committed} track(s), captured {} cover-art object(s)",
+                job.id,
+                job.artwork.len()
+            );
+        }
+        return Ok(());
+    }
+
+    match args.command.as_ref().unwrap() {
+        ImportCmd::Plan { path, options } => {
+            let opts = merge_import_options(&trove, options);
+            let source = std::path::Path::new(path);
+            let job = trove
+                .import_plan(source, &opts)
+                .with_context(|| format!("planning import of {path}"))?;
+            print_planned_job(&job, cli.json);
+        }
+        ImportCmd::Run { job_id } => {
+            let job = trove
+                .import_run_job(job_id)
+                .with_context(|| format!("running import job {job_id}"))?;
+            print_run_result(&job, cli.json);
+        }
+        ImportCmd::Verify { job_id } => {
+            let job = trove
+                .import_verify_job(job_id)
+                .with_context(|| format!("verifying import job {job_id}"))?;
+            print_run_result(&job, cli.json);
+        }
+        ImportCmd::Commit { job_id } => {
+            let committed = trove
+                .import_commit_job(job_id)
+                .with_context(|| format!("committing import job {job_id}"))?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "job_id": job_id,
+                        "committed": committed,
+                    }))?
+                );
+            } else {
+                println!("committed {committed} track(s) for job {job_id}");
+            }
+        }
+        ImportCmd::Resume { job_id } => {
+            let job = trove
+                .import_resume(job_id)
+                .with_context(|| format!("resuming import job {job_id}"))?;
+            print_run_result(&job, cli.json);
+            if !cli.json {
+                eprintln!("run `trove import commit {job_id}` when ready to promote");
+            }
+        }
+        ImportCmd::Status { job_id } => {
+            let status = trove
+                .import_status(job_id)
+                .with_context(|| format!("status for import job {job_id}"))?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "job {}  phase={}  total={} committed={} failed={} duplicates={}",
+                    status.id,
+                    status.phase,
+                    status.stats.total,
+                    status.stats.committed,
+                    status.stats.failed,
+                    status.stats.duplicates,
+                );
+            }
+        }
+        ImportCmd::List { all } => {
+            let jobs = trove.import_list(*all)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&jobs)?);
+            } else if jobs.is_empty() {
+                println!("no import jobs");
+            } else {
+                for job in jobs {
+                    println!(
+                        "{}  {}  phase={}  files={} committed={} failed={}  updated={}",
+                        job.id,
+                        job.source_root.display(),
+                        job.phase,
+                        job.total_files,
+                        job.stats.committed,
+                        job.stats.failed,
+                        job.updated_at,
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_import_options(
+    trove: &trove_core::Trove,
+    args: &ImportOptionsArgs,
+) -> trove_core::ImportOptions {
+    trove_core::ImportOptions {
         include_dotfiles: trove.config.import.include_dotfiles || args.include_dotfiles,
         capture_artwork: trove.config.import.capture_artwork && !args.no_artwork,
-    };
+    }
+}
 
-    let source = std::path::Path::new(&args.path);
-    let mut job = trove
-        .import_plan(source, &options)
-        .with_context(|| format!("planning import of {}", args.path))?;
+fn print_planned_job(job: &trove_core::import::ImportJob, json: bool) {
     let stats = job.stats();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "job_id": job.id,
+                "total": stats.total,
+                "duplicates": stats.duplicates,
+                "artwork_candidates": job.artwork.len(),
+                "files": job.files.iter().map(|f| serde_json::json!({
+                    "path": f.path,
+                    "state": f.state.as_str(),
+                    "sha256": f.sha256,
+                })).collect::<Vec<_>>(),
+            }))
+            .expect("serialize plan")
+        );
+        return;
+    }
     println!(
         "planned job {}: {} file(s), {} duplicate(s), {} cover-art candidate(s)",
         job.id,
@@ -207,23 +371,32 @@ fn import(_cli: &Cli, args: &ImportArgs) -> Result<()> {
         stats.duplicates,
         job.artwork.len()
     );
-
-    if args.plan {
-        for file in &job.files {
-            println!("  {:>9}  {}", file.state.as_str(), file.path.display());
-        }
-        for art in &job.artwork {
-            println!("  {:>9}  {}", "artwork", art.path.display());
-        }
-        return Ok(());
+    for file in &job.files {
+        println!("  {:>9}  {}", file.state.as_str(), file.path.display());
     }
+    for art in &job.artwork {
+        println!("  {:>9}  {}", "artwork", art.path.display());
+    }
+}
 
-    let committed = trove.import_run(&mut job).context("running import")?;
+fn print_run_result(job: &trove_core::import::ImportJob, json: bool) {
+    let stats = job.stats();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "job_id": job.id,
+                "phase": job.phase.as_str(),
+                "stats": stats,
+            }))
+            .expect("serialize run result")
+        );
+        return;
+    }
     println!(
-        "committed {committed} track(s) and captured {} cover-art object(s)",
-        job.artwork.len()
+        "job {} phase={} verified={} failed={}",
+        job.id, job.phase, stats.verified, stats.failed
     );
-    Ok(())
 }
 
 fn query(cli: &Cli, args: &QueryArgs) -> Result<()> {

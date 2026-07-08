@@ -35,6 +35,7 @@ pub mod sync;
 pub mod volume;
 
 pub use config::Config;
+pub use db::import::{ImportJobSummary, ImportStatusReport};
 pub use error::{Error, Result};
 pub use facade::Trove;
 pub use import::ImportOptions;
@@ -238,6 +239,97 @@ mod tests {
         assert_eq!(second.files[0].state, FileState::Duplicate);
         assert_eq!(trove.import_run(&mut second).unwrap(), 0);
         assert_eq!(trove.query(&QuerySpec::new(), false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn import_durable_resume_skips_uploaded_files() {
+        use std::sync::{Arc, Mutex};
+
+        struct SharedStub(Arc<Mutex<StubStore>>);
+
+        impl ObjectStore for SharedStub {
+            fn get(&self, key: &str) -> Result<Vec<u8>> {
+                self.0.lock().unwrap().get(key)
+            }
+            fn put(&self, key: &str, bytes: &[u8]) -> Result<crate::store::ObjectMeta> {
+                self.0.lock().unwrap().put(key, bytes)
+            }
+            fn exists(&self, key: &str) -> Result<bool> {
+                self.0.lock().unwrap().exists(key)
+            }
+            fn head(&self, key: &str) -> Result<Option<crate::store::ObjectMeta>> {
+                self.0.lock().unwrap().head(key)
+            }
+            fn copy(&self, from: &str, to: &str) -> Result<crate::store::ObjectMeta> {
+                self.0.lock().unwrap().copy(from, to)
+            }
+            fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.0.lock().unwrap().list(prefix)
+            }
+        }
+
+        struct FailAlwaysOnB {
+            inner: Arc<Mutex<StubStore>>,
+        }
+
+        impl ObjectStore for FailAlwaysOnB {
+            fn get(&self, key: &str) -> Result<Vec<u8>> {
+                self.inner.lock().unwrap().get(key)
+            }
+            fn put(&self, key: &str, bytes: &[u8]) -> Result<crate::store::ObjectMeta> {
+                if key.contains("b.mp3") {
+                    return Err(Error::store("simulated persistent upload failure"));
+                }
+                self.inner.lock().unwrap().put(key, bytes)
+            }
+            fn exists(&self, key: &str) -> Result<bool> {
+                self.inner.lock().unwrap().exists(key)
+            }
+            fn head(&self, key: &str) -> Result<Option<crate::store::ObjectMeta>> {
+                self.inner.lock().unwrap().head(key)
+            }
+            fn copy(&self, from: &str, to: &str) -> Result<crate::store::ObjectMeta> {
+                self.inner.lock().unwrap().copy(from, to)
+            }
+            fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.inner.lock().unwrap().list(prefix)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.mp3"), b"audio-a").unwrap();
+        std::fs::write(dir.path().join("b.mp3"), b"audio-b").unwrap();
+        let home = tempfile::tempdir().unwrap();
+
+        let shared = Arc::new(Mutex::new(StubStore::new()));
+        let config = test_config();
+        let mut trove = Trove::open_with_store(
+            config.clone(),
+            home.path(),
+            Box::new(FailAlwaysOnB {
+                inner: shared.clone(),
+            }),
+        )
+        .unwrap();
+
+        let job = trove
+            .import_plan(dir.path(), &ImportOptions::default())
+            .unwrap();
+        assert_eq!(job.files.len(), 2);
+
+        let partial = trove.import_run_job(&job.id).unwrap();
+        assert_eq!(partial.files[0].state, FileState::Verified);
+        assert_eq!(partial.files[1].state, FileState::Failed);
+
+        let mut trove2 =
+            Trove::open_with_store(config, home.path(), Box::new(SharedStub(shared))).unwrap();
+        let resumed = trove2.import_resume(&job.id).unwrap();
+        assert_eq!(resumed.files[0].state, FileState::Verified);
+        assert_eq!(resumed.files[1].state, FileState::Verified);
+
+        let committed = trove2.import_commit_job(&job.id).unwrap();
+        assert_eq!(committed, 2);
+        assert_eq!(trove2.import_status(&job.id).unwrap().stats.committed, 2);
     }
 
     #[test]
