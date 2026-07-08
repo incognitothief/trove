@@ -1,109 +1,68 @@
 # AGENTS.md
 
-Orientation for AI agents and new contributors working in this repo. Read this
-first, then the ADRs in `docs/adr/`.
+Durable guidance for working in Trove. This file holds principles, not
+inventory. When it disagrees with the code or the ADRs, they win — and you
+should update this file only if an actual principle changed. If you're tempted
+to add a file path, a module list, or a status checklist here, it belongs in the
+code, the ADRs, or `make help` instead.
 
-## What Trove is
+## Orient yourself first
 
-A portable DJ library recovery/export tool. The bucket (S3) is the only durable
-source of truth; the local host cache (`~/.trove`), performance drives, and
-local indexes are all disposable and rebuild themselves from the bucket on the
-next read ("reads reconcile with the bucket"). See
-[ADR 000](docs/adr/000-bootstrap.md) for the initial design notes, and following ADR's for progress.
+- **Read the ADRs in `docs/adr/`.** They are the source of truth for the
+  architecture and the running record of decisions. Read in order; the latest
+  ones describe current state and open follow-ups.
+- **Discover the structure, don't memorize it.** Skim the tree and run
+  `make help`. Any map written here would go stale — explore instead.
 
-## The one rule
+## The invariant that defines this project
 
-**All domain logic lives in `trove-core`.** `trove-cli`, `trove-serverd`, and the
-React `ui/` are thin clients: they translate input into a single `trove_core`
-call and render the result. If you're about to write query/reconcile/sync/import
-logic in a client, stop — it belongs in the core.
+**Everything but the bucket is disposable.** The remote object store (the
+bucket) is the only durable source of truth. Local caches, indexes, host state,
+and performance drives are all rebuildable and must be treated as throwaway.
+Reads reconcile against the bucket before serving. Never let host or drive state
+become authoritative.
 
-## Project structure
+## The one architectural rule
 
-```
-crates/
-  trove-core/            # authoritative library — ALL logic
-    src/
-      facade.rs          # `Trove` — the entry point clients drive
-      config.rs          # ~/.trove/config.toml
-      model.rs           # domain types (TrackId, ArchiveEntry, Playlist, …)
-      error.rs           # Error / Result; clients map these to output
-      query.rs           # QuerySpec (declarative; compiled to SQL in db)
-      store/             # ObjectStore trait (the bucket) + fs.rs, stub.rs
-      metadata.rs        # MetadataExtractor trait + StubExtractor
-      db/
-        schema.rs        # SQL DDL for all local SQLite DBs
-        archive.rs       # archive.sqlite: cache + query + generation stamp
-      archive/
-        index.rs         # JSONL / schema-version interchange + BucketPaths
-        reconcile.rs     # local-cache ↔ bucket reconciliation
-      import/            # bulk import: state.rs (Phase/FileState) + pipeline
-      playlist.rs        # playlists.sqlite CRUD
-      volume.rs          # removable volume layout + identity
-      sync.rs            # transfer/export planning
-  trove-cli/             # `trove` binary (clap). src/runtime.rs = client wiring
-  trove-serverd/         # axum HTTP/JSON API. src/runtime.rs = client wiring
-ui/                      # Vite + React + TS; src/api.ts wraps the daemon
-docs/adr/                # decision records (000 architecture, 001 retrospective)
-Makefile                 # dev tasks (see `make help`)
-```
+**All domain logic lives in the core library crate.** The CLI, the HTTP daemon,
+and the web UI are *thin clients*: each translates input into a single core call
+and renders the result — nothing more. If you find yourself writing
+reconcile/query/sync/import logic in a client, move it into the core. This is
+what lets a fix land once and surface everywhere.
 
-## Build / run / test
+## Design conventions (stable)
 
-```bash
-make deps     # install Rust + UI deps
-make build    # cargo build --workspace
-make test     # cargo test --workspace
-make lint     # cargo clippy --workspace --all-targets
-make dev      # boot daemon + UI via scripts/dev.sh (waits for readiness, prints addresses)
-make cli ARGS="query --limit 20"
-```
+- **Abstract external systems.** Depend on a trait for anything external
+  (object store, metadata extraction, …), never on a concrete vendor/SDK. A new
+  backend is a new implementation of an existing trait, not a change to callers.
+- **One error surface.** Fallible core operations return the crate's shared
+  `Result`/`Error`. Mark deliberate gaps with an explicit "not implemented"
+  error so clients surface them honestly rather than faking success.
+- **Wiring stays in clients.** Config discovery and backend selection live in
+  the clients; keep client concerns out of the core.
+- **Local stores are disposable.** Schemas apply idempotently; a store is always
+  safe to delete and rebuild.
+- **Tolerant wire types.** Serialized request/response types default missing
+  fields so evolving clients don't break on partial input.
 
-Always run `make lint` and `make test` before finishing a change; both are clean
-today and should stay that way.
+## Working agreements
 
-## Conventions
+- Keep changes behind the core's public entry point; clients shouldn't reach
+  into internals.
+- Before finishing: build, test, and lint must be clean. Use `make help` for the
+  exact targets — all are expected to stay green.
+- Record consequential decisions as a **new** ADR; don't rewrite old ones. Leave
+  a short, honest trail of what's real vs. deferred.
 
-- **Errors:** fallible core functions return `trove_core::error::Result<T>`.
-  Use `Error::NotImplemented("…")` for deliberate stubs (clients surface it).
-- **Backends are traits, not concretions.** Depend on `ObjectStore` /
-  `MetadataExtractor`, never on S3 or a codec directly. New backends are new impls.
-- **Local DBs are disposable.** Opening a DB applies its schema idempotently;
-  never treat `~/.trove` as authoritative. Only the bucket is.
-- **Reads reconcile first.** Facade read methods (`query`, `plan_playlist_sync`)
-  call `reconcile` before serving. Preserve that ordering.
-- **Client wiring stays in clients.** Store/config selection lives in each
-  client's `runtime.rs`, not in `trove-core`.
-- **serde on wire types:** request/response structs need `#[serde(default)]` on
-  optional fields (see `QuerySpec`) so partial JSON from the UI deserializes.
+## Finding what's unfinished
 
-## Testing pattern
+Don't trust a checklist in this file — it rots. Instead:
 
-Core tests use in-memory state and a seeded stub bucket:
-`Trove::in_memory_with_store(config, store)` with a `StubStore` pre-loaded with
-`archive-index.jsonl` + `schema-version.json`. See the `tests` module in
-`crates/trove-core/src/lib.rs` for the template.
+- `grep` for the "not implemented" marker to find live stubs and seams.
+- The most recent ADR tracks current status and prioritized follow-ups.
 
-## Current stubs / follow-ups (priority order)
+## Dev workflow
 
-Tracked in ADR 001; grep for `NotImplemented` to find seams.
-
-1. Persist import state to `import_jobs`/`import_files`; wire `import resume`
-   (in-memory job state today means a crash restarts, not resumes).
-2. S3-backed `ObjectStore` (multipart, staging→commit, verify).
-3. Compare-and-swap on `schema-version.json` for safe concurrent index writes.
-4. Real metadata extraction; transfer execution (download loop, retry/backoff).
-5. Playlist `.m3u8` export; per-volume DB (diff/status).
-
-## Gotchas
-
-- The daemon opens the SQLite cache at startup. If you import via the CLI while
-  it's running, trigger a reconcile (UI Search) or restart it to see new data.
-- `sync`, `archive verify`, and `playlist export` intentionally report
-  `NotImplemented` — that's expected, not a bug.
-- Keep new modules behind the facade; clients should not gain new imports from
-  deep in `trove-core`.
-
-## Notes from a developer friend
-
-- Always record design decisions in ADR format at `docs/adr`
+- The Makefile is the task index (`make help`): install, build, run, test, lint.
+- The UI hot-reloads on save; the Rust services do not — restart them after
+  changing Rust code.
