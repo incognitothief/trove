@@ -8,6 +8,12 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Production S3-backed object store. Off by default to keep builds fast and
+# tests hermetic/credential-free (ADR 001); opt in for production (ADR 003).
+s3 = ["dep:aws-config", "dep:aws-sdk-s3", "dep:tokio"]
+
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
@@ -19,6 +25,11 @@ sha2.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+
+# S3 backend (optional; enabled by the `s3` feature).
+aws-config = { workspace = true, optional = true }
+aws-sdk-s3 = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

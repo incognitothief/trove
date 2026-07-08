@@ -68,21 +68,110 @@ Run `make` (or `make help`) to list every task. Common ones:
 | `make lint`       | `cargo clippy --workspace --all-targets`            |
 | `make check`      | build + test + lint (pre-commit sanity)             |
 
-## Storage backend (bootstrap)
+## Storage backend
 
-Production storage will be S3 (`aws-sdk-s3`, multipart + staging). Until that
-lands, the CLI and daemon use a **filesystem-backed store** that simulates the
-bucket as a local directory, so everything runs end-to-end with no AWS
-credentials:
+Trove has two bucket backends:
+
+- **Filesystem store** (`FsStore`) — the default bootstrap/dev path. Trove
+  simulates the bucket as a local directory, so everything runs end-to-end with
+  no AWS credentials.
+- **S3 store** (`S3Store`) — the production backend, implemented behind the
+  same `ObjectStore` seam. It is compiled only when you build with
+  `--features s3`.
+
+The core mental model is the same in both cases: the **bucket** is the durable
+source of truth; local SQLite files are disposable caches.
+
+Environment variables:
 
 - `TROVE_HOME` — local cache/config root (default `~/.trove`)
-- `TROVE_BUCKET_DIR` — simulated bucket directory (default `~/.trove/bucket-sim`)
+- `TROVE_BUCKET_DIR` — simulated bucket directory for the filesystem store
+  (default `~/.trove/bucket-sim`)
 
 These are also honored by the Makefile, so you can isolate a demo:
 
 ```bash
 make dev TROVE_HOME=/tmp/trove-demo/home TROVE_BUCKET_DIR=/tmp/trove-demo/bucket
 ```
+
+## Config runbook
+
+`config.toml` tells Trove **where the durable bucket lives**. If no config file
+exists, Trove synthesizes a local-only default:
+
+```toml
+[bucket]
+name = "local"
+region = "local"
+```
+
+That means:
+
+- no config file → filesystem store
+- real bucket config + `--features s3` build → S3 store
+
+### 1. Local-only / no AWS
+
+You do not need a config file for local testing. Trove falls back to the local
+filesystem store automatically.
+
+If you want to make that explicit, create `~/.trove/config.toml`:
+
+```toml
+[bucket]
+name = "local"
+region = "local"
+```
+
+This keeps all durable objects under `TROVE_BUCKET_DIR` (default
+`~/.trove/bucket-sim`).
+
+### 2. Real AWS S3 bucket
+
+1. Create a bucket and note its **name** and **region**.
+2. Ensure AWS credentials work outside Trove first:
+   - `aws sts get-caller-identity`
+   - `aws s3 ls`
+3. Copy `config.example.toml` to `~/.trove/config.toml`.
+4. Set the bucket fields to your real bucket:
+
+```toml
+[bucket]
+name = "your-bucket"
+region = "us-east-1"
+prefix = ".trove"
+music_prefix = "music"
+```
+
+5. Build or run Trove **with** the S3 feature:
+
+```bash
+cargo run -p trove-cli --features s3 -- archive pull-index
+```
+
+If the bucket is brand new, `archive pull-index` should report `EmptyBucket`.
+After your first import it should report a generation such as
+`UpToDate { generation: 1 }`.
+
+Important:
+
+- A real bucket config **without** `--features s3` will fail with a clear error.
+- The convenience wrapper `bin/trove` does **not** add `--features s3` for you.
+- `make cli` also does not add the feature automatically; use `cargo run ... --features s3`
+  when talking to S3.
+
+### 3. S3-compatible endpoints (MinIO, R2, etc.)
+
+Set `endpoint` in the bucket config:
+
+```toml
+[bucket]
+name = "trove-test"
+region = "us-east-1"
+endpoint = "https://s3.example.com"
+```
+
+Trove will force path-style addressing for custom endpoints.
 
 ## Try the CLI
 
@@ -125,9 +214,28 @@ make cli ARGS="query --artist 'Theo Parrish'"   # or pass everything via ARGS
 
 ## Status
 
-This is the bootstrap scaffold. Fully wired end-to-end (against the filesystem
-store): config, local SQLite indexes, bucket reconciliation, declarative query,
-playlists, and the bulk-import pipeline. Deliberately deferred work (S3 store,
-real metadata extraction, transfer execution, `.m3u8` export, persistent import
-resume) is tracked in [ADR 001](docs/adr/001-bootstrap-implementation.md) and
-marked `NotImplemented` in code.
+This is still the bootstrap scaffold, but it now has a real S3-backed storage
+path in addition to the filesystem simulator.
+
+Working today:
+
+- local config + disposable SQLite caches
+- bucket reconciliation via `schema-version.json`
+- declarative query
+- playlists
+- bulk import pipeline (`scan → hash → dedupe → upload → verify → commit → push index`)
+- filesystem-backed bucket simulation (`FsStore`)
+- feature-gated S3-backed bucket (`S3Store`, `--features s3`)
+
+Still deliberately deferred:
+
+- streaming / checkpointed resumable multipart uploads
+- compare-and-swap protection on `schema-version.json` for concurrent importers
+- real metadata extraction
+- transfer execution / retry / verify loops for sync-to-volume
+- `.m3u8` export
+- persistent import resume
+
+See [ADR 001](docs/adr/001-bootstrap-implementation.md) for the bootstrap
+retrospective and [ADR 003](docs/adr/003-s3-object-store.md) for the S3 design
+and trade-offs.

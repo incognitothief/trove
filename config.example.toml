@@ -2,6 +2,8 @@
 # Copy to ~/.trove/config.toml and adjust. See ADR 000 (docs/adr/000-bootstrap.md).
 
 # Canonical durable archive (the only source of truth).
+# A real (non-"local") bucket requires binaries built with `--features s3`
+# (ADR 003). Set region = "local" to use the filesystem bucket simulator.
 [bucket]
 name = "your-bucket"
 region = "us-east-1"

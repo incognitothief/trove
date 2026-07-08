@@ -12,6 +12,11 @@ authors.workspace = true
 name = "trove"
 path = "src/main.rs"
 
+[features]
+default = []
+# Build with the production S3 object store (ADR 003).
+s3 = ["trove-core/s3"]
+
 [dependencies]
 trove-core.workspace = true
 clap.workspace = true

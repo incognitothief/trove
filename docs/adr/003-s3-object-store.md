@@ -96,6 +96,17 @@ async, or introducing a distinct async object-store trait, is explicitly out of
 scope — it would ripple through every caller and both clients for no benefit at
 this stage.
 
+**We record this as a deliberate, pragmatic choice, not a principled one.** The
+bridge is the lowest-blast-radius way to keep ADR 000's synchronous core while
+adding an async-only SDK, but it has a real smell: it parks a thread per call
+and stands up a second runtime purely to satisfy a sync signature. We are fine
+paying that now. Two named exits, expanded under *Considered alternatives*,
+supersede the bridge if pressure appears: (a) make the `ObjectStore` trait
+async if the daemon ever needs genuine concurrency, or (b) adopt a
+blocking-native S3 client to delete the bridge outright while staying sync.
+Either is an acceptable future direction; both were understood when choosing the
+bridge for the first cut.
+
 ### 3. Multipart uploads
 
 `put` chunks buffers larger than a fixed threshold into a multipart upload
@@ -190,20 +201,55 @@ must continue to treat `ObjectMeta.etag` as opaque.
 
 ## Considered alternatives
 
-- **Make the `ObjectStore` trait (and the core) async.** Rejected for now:
-  it would propagate `async` through every core method and both clients,
-  contradicting ADR 000's thin-sync-core / mutex-guarded-daemon design, for no
-  user-visible gain. The bridge confines all async to one module.
+The chosen sync-over-async bridge (Decision §2) is pragmatic, so its rivals are
+recorded here in enough detail to pick one up later without re-deriving the
+analysis. The first two are the sanctioned exits from the bridge.
+
+- **Make the `ObjectStore` trait (and the core) async — the principled fix.**
+  Turn the trait's methods into `async fn`, let `async` propagate up through
+  `reconcile` / `import` / `facade`, have `trove-cli` open a runtime in `main`,
+  and let `trove-serverd` call the core natively without any bridge or
+  thread-parking. This is the cleanest long-term shape and the most likely place
+  this ends up **if the daemon ever needs real I/O concurrency** (the bridge
+  serializes S3 calls behind blocked worker threads; a truly async core would
+  not). Costs, weighed honestly:
+  - It is a large, cross-cutting change: every `ObjectStore` caller and both
+    clients change, not one module.
+  - Because the core holds the store as `Box<dyn ObjectStore>`, `async fn` in
+    traits is not directly `dyn`-compatible; it needs `async-trait` (which
+    heap-allocates/boxes a future per call) or `#[trait_variant]` — added
+    machinery either way.
+  - It partially revisits ADR 000's deliberate *thin **synchronous** core /
+    mutex-guarded daemon* stance, so it is arguably an ADR-000-scale decision,
+    not just an ADR-003 implementation detail. That scope is why we did not take
+    it in the first cut, not a claim that the bridge is superior.
+- **Use a blocking-native S3 client — delete the bridge while staying sync.**
+  A client with first-class blocking support (e.g. the `rust-s3` crate's
+  `sync`/blocking feature, or a SigV4 signer over a blocking HTTP client)
+  satisfies the existing sync trait **natively**: no tokio, no second runtime,
+  no per-call thread-parking. This is the most direct answer to "why bridge at
+  all?" and keeps ADR 000's sync core untouched. Cost: it means leaving the
+  official `aws-sdk-s3`, which is the more battle-tested implementation of
+  request signing, retry/backoff, and multipart edge cases — meaningful for the
+  one artifact we protect. A strong option specifically when we want to *keep*
+  the core sync; deferred only because the official SDK is the safer default for
+  the initial production backend. If the bridge's smell outweighs SDK maturity,
+  this is the swap to make.
+- **Explicit worker-thread actor instead of spawn-and-block.** A single
+  dedicated thread owning a current-thread runtime and receiving command
+  messages over a channel — functionally equivalent to the chosen bridge but
+  structured as a deliberate actor rather than "spawn onto a runtime, block on a
+  channel." Slightly clearer to read and reason about, but it does **not** remove
+  the underlying sync/async seam or the thread-parking, so it is a cosmetic
+  refinement of the bridge, not an escape from it. Reasonable to adopt if the
+  inline bridge proves hard to follow.
 - **Call `Runtime::block_on` on the ambient thread.** Rejected: panics inside
-  the daemon's `#[tokio::main]` runtime. The dedicated-runtime + channel bridge
-  is the safe equivalent.
+  the daemon's `#[tokio::main]` runtime ("Cannot start a runtime from within a
+  runtime"). The dedicated-runtime + channel bridge is the safe equivalent, and
+  is the reason the bridge spawns rather than blocks directly.
 - **Add `aws-sdk-s3` unconditionally (no feature flag).** Rejected: it would
   regress ADR 001's fast, hermetic, credential-free default builds and tests for
   everyone, including contributors who only touch query/playlist/import logic.
-- **Use a lighter hand-rolled S3 client (raw SigV4 over `reqwest`).** Rejected:
-  more security-sensitive surface (request signing, retries, multipart edge
-  cases) to own and get right than is justified; the official SDK is the durable
-  choice for the one artifact we protect.
 - **Stream from disk with persisted per-part checkpoints now.** Deferred (not
   rejected): the right end state, but it requires a streaming/checkpointed trait
   shape. Landing byte-oriented multipart first keeps this ADR scoped and honest
