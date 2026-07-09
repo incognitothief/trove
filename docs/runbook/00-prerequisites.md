@@ -54,12 +54,68 @@ bin/trove archive pull-index
 
 ## Configuration
 
-Trove reads `~/.trove/config.toml`. If the file is missing, it synthesizes a
-local-only default (`region = "local"`, filesystem bucket simulator).
+Trove reads `~/.trove/config.toml`. The file itself is **optional** — if it is
+missing, Trove synthesizes a local-only default (`name = "local"`,
+`region = "local"`, filesystem bucket simulator).
+
+**Important:** if `config.toml` **exists but is incomplete or invalid** (for
+example, only `name` is set and `region` is missing), Trove **silently ignores
+it** and falls back to the same local default. You will not get S3, and import
+will copy your entire library into `TROVE_BUCKET_DIR` on the host disk. Always
+include **both** `name` and `region` under `[bucket]`, or delete the file and
+rely on the explicit local default.
+
+### `config.toml` field reference
+
+#### `[bucket]` — **required section** (when using a config file)
+
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `name` | **yes** | — | S3 bucket name, or `"local"` for filesystem simulator |
+| `region` | **yes** | — | AWS region (e.g. `us-east-1`), or `"local"` for simulator |
+| `endpoint` | no | (none) | Custom S3-compatible endpoint (MinIO, R2, etc.) |
+| `prefix` | no | `.trove` | Prefix for index and staging objects in the bucket |
+| `music_prefix` | no | `music` | Prefix for committed audio objects |
+
+**Store selection:** if `region = "local"` **or** `name = "local"`, Trove uses
+the filesystem bucket simulator at `TROVE_BUCKET_DIR` (default
+`~/.trove/bucket-sim`). Any other `name` + `region` pair requires a build with
+the `s3` feature (`CARGO_FEATURES=s3`).
+
+#### `[local]` — optional
+
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `music_folder` | no | (none) | Default local music folder when not targeting a volume |
+
+#### `[export]` — optional
+
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `layout` | no | `artist-album` | `artist-album` or `flat` |
+| `playlist_format` | no | `m3u8` | `m3u8` or `m3u` |
+
+#### `[mixxx]` — optional
+
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `relative_paths` | no | `true` | Use relative paths in Mixxx playlists |
+
+#### `[import]` — optional
+
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `include_dotfiles` | no | `false` | Include hidden files/dirs in import scans |
+| `capture_artwork` | no | `true` | Capture co-located cover art during import |
+
+#### `[profiles.<name>]` — optional
+
+Named alternate bucket targets. Each profile requires `bucket` and `region`;
+`endpoint` is optional. See `config.example.toml` in the repo root.
 
 ### Local-only (no AWS)
 
-No config file required. Optional explicit config:
+No config file required. If you write one, **both** fields are required:
 
 ```toml
 # ~/.trove/config.toml
@@ -68,20 +124,27 @@ name = "local"
 region = "local"
 ```
 
-Objects live under `TROVE_BUCKET_DIR` (default `~/.trove/bucket-sim`).
+Objects are copied into `TROVE_BUCKET_DIR` (default `~/.trove/bucket-sim`).
+Import duplicates every staged file onto that disk — for large libraries, point
+`TROVE_BUCKET_DIR` at a volume with enough free space:
+
+```bash
+export TROVE_BUCKET_DIR=/Volumes/LargeDrive/trove-bucket
+```
 
 ### Real AWS S3
 
 1. Create a bucket; note **name** and **region**.
 2. Verify credentials outside Trove: `aws sts get-caller-identity`, `aws s3 ls`.
-3. Copy `config.example.toml` to `~/.trove/config.toml`:
+3. Copy `config.example.toml` to `~/.trove/config.toml` and set **both**
+   required bucket fields:
 
 ```toml
 [bucket]
-name = "your-bucket"
-region = "us-east-1"
-prefix = ".trove"
-music_prefix = "music"
+name = "your-bucket"      # required
+region = "us-east-1"      # required
+# prefix = ".trove"       # optional (default shown)
+# music_prefix = "music"  # optional (default shown)
 ```
 
 4. Build and run with `--features s3` (see above).
@@ -90,7 +153,7 @@ music_prefix = "music"
 
 ### S3-compatible endpoints (MinIO, R2, etc.)
 
-Add `endpoint` to the bucket section:
+`name` and `region` are still **required**; add `endpoint`:
 
 ```toml
 [bucket]
@@ -128,6 +191,7 @@ The bucket is the source of truth.
 | Symptom | Likely cause | Fix |
 | --- | --- | --- |
 | `no S3 support` | Real bucket config, build without `s3` feature | `CARGO_FEATURES=s3 bin/trove …` |
+| Import fills host disk / `database or disk is full` | Incomplete `config.toml` (missing `region`) silently fell back to local simulator; staging copies files to `TROVE_BUCKET_DIR` | Fix config (`name` + `region` both set), or set `TROVE_BUCKET_DIR` to a large external volume for local mode |
 | `could not read .trove/schema-version.json` | Network/credentials | Fix AWS access; or use `--offline` for read-only |
 | `mount point … not found` | Drive not mounted | Plug in USB; check `/Volumes/…` path |
 | Sparse artist/album in query/USB folders | Tag extraction deferred | See [ADR 999](../adr/999-known-gaps-and-follow-ups.md#tag-extraction-and-index-metadata-adr-002--adr-004) |
