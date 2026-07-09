@@ -156,9 +156,8 @@ After your first import it should report a generation such as
 Important:
 
 - A real bucket config **without** `--features s3` will fail with a clear error.
-- The convenience wrapper `bin/trove` does **not** add `--features s3` for you.
-- `make cli` also does not add the feature automatically; use `cargo run ... --features s3`
-  when talking to S3.
+- Pass the feature via `CARGO_FEATURES=s3` on `make cli`, `make build`, `make dev`, or
+  `bin/trove` (e.g. `make cli CARGO_FEATURES=s3 import list`).
 
 ### 3. S3-compatible endpoints (MinIO, R2, etc.)
 

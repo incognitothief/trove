@@ -6,6 +6,7 @@
 #   trove query --limit 20
 #
 # All arguments are forwarded verbatim to `cargo run -p trove-cli`.
+# Set CARGO_FEATURES=s3 when ~/.trove/config.toml points at a real bucket.
 set -euo pipefail
 
 # Resolve the repo root (the directory containing this script's parent), so the
@@ -16,4 +17,8 @@ REPO_ROOT="$(dirname -- "$SCRIPT_DIR")"
 CARGO="${CARGO:-cargo}"
 
 cd -- "$REPO_ROOT"
-exec "$CARGO" run --quiet -p trove-cli -- "$@"
+if [ -n "${CARGO_FEATURES:-}" ]; then
+  exec "$CARGO" run --quiet -p trove-cli --features "$CARGO_FEATURES" -- "$@"
+else
+  exec "$CARGO" run --quiet -p trove-cli -- "$@"
+fi

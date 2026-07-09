@@ -13,15 +13,20 @@ use crate::archive::reconcile::{reconcile, ReconcileReport};
 use crate::archive::CURRENT_SCHEMA_VERSION;
 use crate::config::Config;
 use crate::db::archive::ArchiveDb;
+use crate::db::import::{ImportDb, ImportJobSummary, ImportStatusReport};
+use crate::db::transfer::TransferDb;
+use crate::db::volume::VolumeFileStats;
 use crate::error::Result;
-use crate::import::{self, ImportJob, ImportOptions};
+use crate::import::ImportProgress;
+use crate::import::{self, ImportJob, ImportOptions, Phase};
 use crate::metadata::{MetadataExtractor, StubExtractor};
 use crate::model::SchemaVersion;
 use crate::model::{ArchiveEntry, ArtworkRecord, Playlist, TrackId};
 use crate::playlist::PlaylistDb;
 use crate::query::QuerySpec;
 use crate::store::{stub::StubStore, ObjectStore};
-use crate::sync::{self, SyncPlan};
+use crate::sync::{self, PlaylistExport, SyncPlan, VolumeDiffEntry};
+use crate::volume;
 
 /// Aggregates configuration, local databases, and the durable object store.
 pub struct Trove {
@@ -30,6 +35,8 @@ pub struct Trove {
     pub paths: BucketPaths,
     archive: ArchiveDb,
     playlists: PlaylistDb,
+    import_db: ImportDb,
+    transfer_db: TransferDb,
     store: Box<dyn ObjectStore>,
     extractor: Box<dyn MetadataExtractor>,
 }
@@ -47,12 +54,16 @@ impl Trove {
         );
         let archive = ArchiveDb::open(&home.join("archive.sqlite"))?;
         let playlists = PlaylistDb::open(&home.join("playlists.sqlite"))?;
+        let import_db = ImportDb::open(&home.join("sync.sqlite"))?;
+        let transfer_db = TransferDb::open(&home.join("sync.sqlite"))?;
         Ok(Trove {
             config,
             home: home.to_path_buf(),
             paths,
             archive,
             playlists,
+            import_db,
+            transfer_db,
             store,
             extractor: Box::new(StubExtractor),
         })
@@ -75,6 +86,8 @@ impl Trove {
             paths,
             archive: ArchiveDb::in_memory()?,
             playlists: PlaylistDb::in_memory()?,
+            import_db: ImportDb::in_memory()?,
+            transfer_db: TransferDb::in_memory()?,
             store,
             extractor: Box::new(StubExtractor),
         })
@@ -125,8 +138,11 @@ impl Trove {
 
     // --- Sync / export ---------------------------------------------------
 
-    /// Resolve the entries in a playlist and build a sync plan for a volume.
-    pub fn plan_playlist_sync(&mut self, name: &str, allow_offline: bool) -> Result<SyncPlan> {
+    fn resolve_playlist_entries(
+        &mut self,
+        name: &str,
+        allow_offline: bool,
+    ) -> Result<Vec<ArchiveEntry>> {
         self.reconcile(allow_offline)?;
         let playlist = self.playlists.get(name)?;
         let mut entries = Vec::new();
@@ -135,48 +151,425 @@ impl Trove {
                 entries.push(entry);
             }
         }
-        Ok(sync::plan_playlist_sync(
+        Ok(entries)
+    }
+
+    /// Resolve playlist entries and build a sync plan for a volume.
+    pub fn plan_playlist_sync(
+        &mut self,
+        name: &str,
+        mount: &Path,
+        allow_offline: bool,
+    ) -> Result<SyncPlan> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        let entries = self.resolve_playlist_entries(name, allow_offline)?;
+        sync::plan_sync(
             &entries,
             self.config.export.layout,
+            Some(&volume_db),
+            Some(mount),
+        )
+    }
+
+    /// Plan a sync from a query result set.
+    pub fn plan_query_sync(
+        &mut self,
+        spec: &QuerySpec,
+        mount: &Path,
+        allow_offline: bool,
+    ) -> Result<SyncPlan> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        let entries = self.query(spec, allow_offline)?;
+        sync::plan_sync(
+            &entries,
+            self.config.export.layout,
+            Some(&volume_db),
+            Some(mount),
+        )
+    }
+
+    /// Execute a playlist sync: transfer tracks and write the playlist file.
+    pub fn run_playlist_sync(
+        &mut self,
+        name: &str,
+        mount: &Path,
+        allow_offline: bool,
+    ) -> Result<(SyncPlan, usize, usize)> {
+        let plan = self.plan_playlist_sync(name, mount, allow_offline)?;
+        let (done, failed) = self.execute_sync_plan(name, mount, allow_offline, &plan)?;
+        let entries = self.resolve_playlist_entries(name, allow_offline)?;
+        let export = sync::export_playlist(
+            name,
+            &entries,
+            self.config.export.layout,
+            self.config.export.playlist_format,
+            self.config.mixxx.relative_paths,
+        );
+        sync::write_playlist_export(mount, &export)?;
+        Ok((plan, done, failed))
+    }
+
+    /// Continue the latest active sync job.
+    pub fn resume_sync(&mut self, allow_offline: bool) -> Result<(usize, usize)> {
+        let job = self
+            .transfer_db
+            .latest_active_job()?
+            .ok_or_else(|| crate::error::Error::not_found("active sync job"))?;
+        let mount = PathBuf::from(&job.mount_point);
+        let entries = if let Some(name) = &job.playlist_name {
+            self.resolve_playlist_entries(name, allow_offline)?
+        } else {
+            Vec::new()
+        };
+        let entries_by_id: std::collections::HashMap<String, ArchiveEntry> = entries
+            .iter()
+            .map(|e| (e.track_id.0.clone(), e.clone()))
+            .collect();
+        let identity = volume::read_identity(&mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        sync::run_sync_job(
+            &mount,
+            &entries_by_id,
+            &self.transfer_db,
+            &volume_db,
+            self.store.as_ref(),
+            &job.id,
+        )
+    }
+
+    /// Verify expected tracks on a mounted volume.
+    pub fn verify_volume_sync(
+        &mut self,
+        mount: &Path,
+        playlist_name: Option<&str>,
+        spec: Option<&QuerySpec>,
+        allow_offline: bool,
+    ) -> Result<(usize, usize, usize)> {
+        let entries = if let Some(name) = playlist_name {
+            self.resolve_playlist_entries(name, allow_offline)?
+        } else if let Some(spec) = spec {
+            self.query(spec, allow_offline)?
+        } else {
+            return Err(crate::error::Error::Other(
+                "verify requires --playlist or query filters".into(),
+            ));
+        };
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        sync::verify_volume(mount, &entries, self.config.export.layout, &volume_db)
+    }
+
+    /// Export a logical playlist as a portable file body + relative paths.
+    pub fn playlist_export(&mut self, name: &str, allow_offline: bool) -> Result<PlaylistExport> {
+        let entries = self.resolve_playlist_entries(name, allow_offline)?;
+        Ok(sync::export_playlist(
+            name,
+            &entries,
+            self.config.export.layout,
+            self.config.export.playlist_format,
+            self.config.mixxx.relative_paths,
         ))
+    }
+
+    /// List host-side volume records.
+    pub fn volume_list(&self) -> Result<Vec<crate::model::VolumeIdentity>> {
+        if self.home == Path::new(":memory:") {
+            return Ok(Vec::new());
+        }
+        volume::list_volumes(&self.home)
+    }
+
+    /// Volume identity plus file stats from the host DB.
+    pub fn volume_status(
+        &self,
+        mount: &Path,
+    ) -> Result<(crate::model::VolumeIdentity, VolumeFileStats)> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        Ok((identity, volume_db.stats()?))
+    }
+
+    /// Diff playlist or query tracks against a volume without transferring.
+    pub fn volume_diff(
+        &mut self,
+        mount: &Path,
+        playlist_name: Option<&str>,
+        spec: Option<&QuerySpec>,
+        allow_offline: bool,
+    ) -> Result<Vec<VolumeDiffEntry>> {
+        let entries = if let Some(name) = playlist_name {
+            self.resolve_playlist_entries(name, allow_offline)?
+        } else if let Some(spec) = spec {
+            self.query(spec, allow_offline)?
+        } else {
+            return Err(crate::error::Error::Other(
+                "diff requires --playlist or query filters".into(),
+            ));
+        };
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        sync::diff_volume(&entries, self.config.export.layout, &volume_db, mount)
+    }
+
+    fn execute_sync_plan(
+        &mut self,
+        playlist_name: &str,
+        mount: &Path,
+        allow_offline: bool,
+        plan: &SyncPlan,
+    ) -> Result<(usize, usize)> {
+        let identity = volume::read_identity(mount)?
+            .ok_or_else(|| crate::error::Error::not_found("volume identity on mount"))?;
+        let volume_db = volume::open_volume_db(&self.home, &identity)?;
+        let job_id = self.transfer_db.create_job(
+            &identity.volume_id,
+            &mount.display().to_string(),
+            Some(playlist_name),
+        )?;
+        for transfer in &plan.transfers {
+            self.transfer_db
+                .insert_transfer(&job_id, &identity.volume_id, transfer)?;
+        }
+        let entries = self.resolve_playlist_entries(playlist_name, allow_offline)?;
+        let entries_by_id: std::collections::HashMap<String, ArchiveEntry> = entries
+            .iter()
+            .map(|e| (e.track_id.0.clone(), e.clone()))
+            .collect();
+        sync::run_sync_job(
+            mount,
+            &entries_by_id,
+            &self.transfer_db,
+            &volume_db,
+            self.store.as_ref(),
+            &job_id,
+        )
     }
 
     // --- Import ----------------------------------------------------------
 
-    /// Plan a bulk import (scan + hash + dedupe + gather art). Dry-run friendly.
-    pub fn import_plan(&self, source_root: &Path, options: &ImportOptions) -> Result<ImportJob> {
-        import::plan(
+    /// Plan a bulk import (scan + hash + dedupe + gather art), persist to
+    /// `sync.sqlite`, and write a local manifest.
+    pub fn import_plan(
+        &self,
+        source_root: &Path,
+        options: &ImportOptions,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
+        let job = import::plan(
             source_root,
             import::DEFAULT_AUDIO_EXTENSIONS,
             options,
             Some(&self.archive),
-        )
+            Some(&self.import_db),
+            None,
+            progress,
+        )?;
+        self.import_db.save_job(&job, options)?;
+        if self.home != Path::new(":memory:") {
+            import::write_manifest(&self.home, &job)?;
+        }
+        Ok(job)
+    }
+
+    /// Continue fingerprinting for a job interrupted during plan.
+    pub fn import_continue_plan(
+        &self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
+        let (job, options) = self.import_db.load_job(job_id)?;
+        let job = import::plan(
+            &job.source_root,
+            import::DEFAULT_AUDIO_EXTENSIONS,
+            &options,
+            Some(&self.archive),
+            Some(&self.import_db),
+            Some(job_id),
+            progress,
+        )?;
+        self.import_db.save_job(&job, &options)?;
+        if self.home != Path::new(":memory:") {
+            import::write_manifest(&self.home, &job)?;
+        }
+        Ok(job)
+    }
+
+    /// Upload + verify for a persisted job (no commit).
+    pub fn import_run_job(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
+        let (mut job, options) = self.import_db.load_job(job_id)?;
+        import::prepare_for_resume(&mut job);
+        import::refresh_changed_files(&mut job)?;
+        import::upload(
+            &mut job,
+            self.store.as_ref(),
+            &self.paths,
+            Some(&self.import_db),
+            progress,
+        )?;
+        import::verify(
+            &mut job,
+            self.store.as_ref(),
+            Some(&self.import_db),
+            progress,
+        )?;
+        self.import_db.save_job(&job, &options)?;
+        if self.home != Path::new(":memory:") {
+            import::write_manifest(&self.home, &job)?;
+        }
+        Ok(job)
+    }
+
+    /// Re-verify staged objects for a persisted job.
+    pub fn import_verify_job(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
+        let (mut job, options) = self.import_db.load_job(job_id)?;
+        import::verify(
+            &mut job,
+            self.store.as_ref(),
+            Some(&self.import_db),
+            progress,
+        )?;
+        self.import_db.save_job(&job, &options)?;
+        if self.home != Path::new(":memory:") {
+            import::write_manifest(&self.home, &job)?;
+        }
+        Ok(job)
+    }
+
+    /// Commit verified files, capture artwork, and push the canonical index.
+    pub fn import_commit_job(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<usize> {
+        let (mut job, options) = self.import_db.load_job(job_id)?;
+        let committed = import::commit(
+            &mut job,
+            self.store.as_ref(),
+            &self.paths,
+            &self.archive,
+            self.extractor.as_ref(),
+            Some(&self.import_db),
+            progress,
+        )?;
+        for entry in &committed {
+            self.archive.upsert(entry)?;
+        }
+        let artwork = import::capture_artwork(&mut job, self.store.as_ref(), &self.paths)?;
+        self.append_artwork_manifest(&artwork)?;
+        self.push_index()?;
+        self.import_db.save_job(&job, &options)?;
+        if self.home != Path::new(":memory:") {
+            import::write_manifest(&self.home, &job)?;
+        }
+        Ok(committed.len())
+    }
+
+    /// Continue from the last safe state (fingerprint, upload, or verify).
+    pub fn import_resume(
+        &mut self,
+        job_id: &str,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<ImportJob> {
+        let (job, _) = self.import_db.load_job(job_id)?;
+        if job.phase == Phase::Fingerprint {
+            self.import_continue_plan(job_id, progress)?;
+        }
+        self.import_run_job(job_id, progress)
+    }
+
+    /// Structured per-job status.
+    pub fn import_status(&self, job_id: &str) -> Result<ImportStatusReport> {
+        self.import_db.status(job_id)
+    }
+
+    /// List import jobs (default: incomplete; pass `all` for full history).
+    pub fn import_list(&self, all: bool) -> Result<Vec<ImportJobSummary>> {
+        self.import_db.list_jobs(all)
+    }
+
+    /// Remove durable import bookkeeping for a job (local only).
+    pub fn import_prune(&self, job_id: &str) -> Result<()> {
+        self.import_db.prune_job(job_id)?;
+        if self.home != Path::new(":memory:") {
+            import::remove_manifest(&self.home, job_id)?;
+        }
+        Ok(())
+    }
+
+    /// Convenience one-shot: plan → upload → verify → commit.
+    pub fn import_run_full(
+        &mut self,
+        source_root: &Path,
+        options: &ImportOptions,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<(ImportJob, usize)> {
+        let job = self.import_plan(source_root, options, progress)?;
+        self.import_run_job(&job.id, progress)?;
+        let committed = self.import_commit_job(&job.id, progress)?;
+        let (job, _) = self.import_db.load_job(&job.id)?;
+        Ok((job, committed))
     }
 
     /// Run a planned import to completion: upload → verify → commit, capture any
     /// co-located cover art, then advance the canonical index (only after commit).
-    pub fn import_run(&mut self, job: &mut ImportJob) -> Result<usize> {
-        import::upload(job, self.store.as_ref(), &self.paths)?;
-        import::verify(job, self.store.as_ref())?;
+    pub fn import_run(
+        &mut self,
+        job: &mut ImportJob,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<usize> {
+        let options = self.loaded_options(&job.id).unwrap_or_default();
+        self.import_db.save_job(job, &options)?;
+        import::prepare_for_resume(job);
+        import::refresh_changed_files(job)?;
+        import::upload(
+            job,
+            self.store.as_ref(),
+            &self.paths,
+            Some(&self.import_db),
+            progress,
+        )?;
+        import::verify(job, self.store.as_ref(), Some(&self.import_db), progress)?;
         let committed = import::commit(
             job,
             self.store.as_ref(),
             &self.paths,
             &self.archive,
             self.extractor.as_ref(),
+            Some(&self.import_db),
+            progress,
         )?;
         for entry in &committed {
             self.archive.upsert(entry)?;
         }
-
-        // Capture co-located cover art while the source is still present, and
-        // record its provenance durably for later curation (ADR 002).
         let artwork = import::capture_artwork(job, self.store.as_ref(), &self.paths)?;
         self.append_artwork_manifest(&artwork)?;
-
-        // The index only advances after commit; push the new canonical index.
         self.push_index()?;
+        self.import_db.save_job(job, &options)?;
+        if self.home != Path::new(":memory:") {
+            import::write_manifest(&self.home, job)?;
+        }
         Ok(committed.len())
+    }
+
+    fn loaded_options(&self, job_id: &str) -> Result<ImportOptions> {
+        let (_, options) = self.import_db.load_job(job_id)?;
+        Ok(options)
     }
 
     /// Merge new artwork provenance records into the durable bucket manifest,

@@ -23,6 +23,19 @@ pub enum Phase {
 }
 
 impl Phase {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "scan" => Some(Phase::Scan),
+            "fingerprint" => Some(Phase::Fingerprint),
+            "dedupe" => Some(Phase::Dedupe),
+            "upload" => Some(Phase::Upload),
+            "verify" => Some(Phase::Verify),
+            "commit" => Some(Phase::Commit),
+            "done" => Some(Phase::Done),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Phase::Scan => "scan",
@@ -31,6 +44,19 @@ impl Phase {
             Phase::Upload => "upload",
             Phase::Verify => "verify",
             Phase::Commit => "commit",
+            Phase::Done => "done",
+        }
+    }
+
+    /// Present-tense verb for human progress output (CLI headers).
+    pub fn progress_label(&self) -> &'static str {
+        match self {
+            Phase::Scan => "scanning",
+            Phase::Fingerprint => "fingerprinting",
+            Phase::Dedupe => "deduping",
+            Phase::Upload => "uploading",
+            Phase::Verify => "verifying",
+            Phase::Commit => "committing",
             Phase::Done => "done",
         }
     }
@@ -64,6 +90,21 @@ pub enum FileState {
 }
 
 impl FileState {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(FileState::Pending),
+            "scanning" => Some(FileState::Scanning),
+            "hashed" => Some(FileState::Hashed),
+            "duplicate" => Some(FileState::Duplicate),
+            "uploading" => Some(FileState::Uploading),
+            "uploaded" => Some(FileState::Uploaded),
+            "verified" => Some(FileState::Verified),
+            "committed" => Some(FileState::Committed),
+            "failed" => Some(FileState::Failed),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             FileState::Pending => "pending",

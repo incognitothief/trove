@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
@@ -44,7 +44,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/playlists", get(list_playlists).post(create_playlist))
         .route("/playlists/:name", get(get_playlist))
         .route("/playlists/:name/tracks", post(add_tracks))
-        .route("/import", post(import))
+        .route("/import", get(list_imports).post(import))
+        .route("/import/:id", delete(prune_import))
+        .route("/import/:id/status", get(import_status))
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http());
@@ -140,11 +142,38 @@ async fn add_tracks(
     Ok(Json(json!({ "added": ids.len() })))
 }
 
+async fn list_imports(State(state): State<AppState>) -> Result<Json<serde_json::Value>, AppError> {
+    let trove = lock(&state)?;
+    let jobs = trove.import_list(false)?;
+    Ok(Json(json!({ "jobs": jobs })))
+}
+
+async fn import_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let trove = lock(&state)?;
+    let status = trove.import_status(&id)?;
+    Ok(Json(json!({ "status": status })))
+}
+
+async fn prune_import(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let trove = lock(&state)?;
+    trove.import_prune(&id)?;
+    Ok(Json(json!({ "pruned": id })))
+}
+
 #[derive(Deserialize)]
 struct ImportBody {
     path: String,
     #[serde(default)]
     plan_only: bool,
+    /// Explicit cover-art image files or folders.
+    #[serde(default)]
+    artwork_paths: Vec<String>,
 }
 
 async fn import(
@@ -152,13 +181,19 @@ async fn import(
     Json(body): Json<ImportBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut trove = lock(&state)?;
+    let mut noop = trove_core::NoopImportProgress;
     let options = trove_core::ImportOptions {
         include_dotfiles: trove.config.import.include_dotfiles,
         capture_artwork: trove.config.import.capture_artwork,
+        artwork_paths: body
+            .artwork_paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
     };
-    let mut job = trove.import_plan(std::path::Path::new(&body.path), &options)?;
-    let stats = job.stats();
     if body.plan_only {
+        let job = trove.import_plan(std::path::Path::new(&body.path), &options, &mut noop)?;
+        let stats = job.stats();
         return Ok(Json(json!({
             "job_id": job.id,
             "total": stats.total,
@@ -166,7 +201,8 @@ async fn import(
             "artwork_candidates": job.artwork.len(),
         })));
     }
-    let committed = trove.import_run(&mut job)?;
+    let (job, committed) =
+        trove.import_run_full(std::path::Path::new(&body.path), &options, &mut noop)?;
     Ok(Json(json!({
         "job_id": job.id,
         "committed": committed,

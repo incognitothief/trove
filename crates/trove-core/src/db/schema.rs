@@ -77,26 +77,43 @@ CREATE TABLE IF NOT EXISTS files (
 /// `~/.trove/sync.sqlite` — transfer state + bulk-import bookkeeping.
 pub const SYNC_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS transfers (
-    id           TEXT PRIMARY KEY,
-    track_id     TEXT NOT NULL,
-    direction    TEXT NOT NULL,         -- download | upload
-    object_key   TEXT NOT NULL,
-    local_path   TEXT,
-    bytes_total  INTEGER,
-    bytes_done   INTEGER NOT NULL DEFAULT 0,
-    status       TEXT NOT NULL,         -- pending | active | done | failed
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    updated_at   TEXT NOT NULL
+    id            TEXT PRIMARY KEY,
+    job_id        TEXT,
+    volume_id     TEXT,
+    track_id      TEXT NOT NULL,
+    direction     TEXT NOT NULL,         -- download | upload
+    object_key    TEXT NOT NULL,
+    relative_path TEXT,
+    local_path    TEXT,
+    bytes_total   INTEGER,
+    bytes_done    INTEGER NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL,         -- pending | active | done | failed
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_jobs (
+    id            TEXT PRIMARY KEY,
+    volume_id     TEXT NOT NULL,
+    mount_point   TEXT NOT NULL,
+    playlist_name TEXT,
+    status        TEXT NOT NULL,         -- active | done
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS import_jobs (
-    id             TEXT PRIMARY KEY,
-    source_root    TEXT NOT NULL,
-    phase          TEXT NOT NULL,       -- scan|fingerprint|dedupe|upload|verify|commit|done
-    staging_prefix TEXT NOT NULL,
-    total_files    INTEGER NOT NULL DEFAULT 0,
-    created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    id               TEXT PRIMARY KEY,
+    source_root      TEXT NOT NULL,
+    phase            TEXT NOT NULL,       -- scan|fingerprint|dedupe|upload|verify|commit|done
+    staging_prefix   TEXT NOT NULL,
+    total_files      INTEGER NOT NULL DEFAULT 0,
+    include_dotfiles INTEGER NOT NULL DEFAULT 0,
+    capture_artwork  INTEGER NOT NULL DEFAULT 1,
+    artwork_paths    TEXT,
+    artwork_json     TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS import_files (
@@ -108,8 +125,10 @@ CREATE TABLE IF NOT EXISTS import_files (
     metadata_extracted INTEGER NOT NULL DEFAULT 0,
     state              TEXT NOT NULL,   -- see import::state::FileState
     s3_object_key      TEXT,
+    track_id           TEXT,
     etag               TEXT,
     error              TEXT,
+    attempts           INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (job_id, path)
 );
 "#;
