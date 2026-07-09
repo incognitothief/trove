@@ -60,7 +60,7 @@ notes). **Closed** items are listed for context only — remove from mental back
 
 | Gap | Notes |
 | --- | ----- |
-| **Runbooks for all command sets** | Need step-by-step runbooks (happy path + resume/recovery) for every CLI surface: `archive`, `import`, `query`, `playlist`, `volume`, `sync`. Today README/ADRs describe architecture; operators still lack copy-paste workflows per command family. |
+| ~~**Runbooks for all command sets**~~ | **Closed** — see [`docs/runbook/`](../runbook/README.md): per-command happy path + resume/recovery for `archive`, `import`, `query`, `playlist`, `volume`, `sync`. |
 | README status section stale | Lists import resume, `.m3u8` export, and sync execution as deferred — several are shipped (ADR 005/006). README should be refreshed or point here. |
 
 ---
@@ -203,3 +203,4 @@ Objects in S3 **do not change** if `sha256` is unchanged. `track_id` stays stabl
 | 2026-07-08 | Created ADR 999. Added playlist `show` gap and runbooks-for-all-command-sets note. Seeded from ADR 001–006 and recent implementation work. |
 | 2026-07-08 | Added tag extraction / metadata backfill section: defer until after archive backfill; index enrichment via upsert + push_index without re-upload. |
 | 2026-07-08 | Reconciled early genesis gap analysis: closed import/sync/export items; added archive verify, bucket index form, UI workflow table, packaging gaps, revised priority. |
+| 2026-07-08 | Closed operator runbooks gap — added `docs/runbook/` (archive, import, query, playlist, volume, sync). |
