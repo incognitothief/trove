@@ -94,6 +94,12 @@ These are also honored by the Makefile, so you can isolate a demo:
 make dev TROVE_HOME=/tmp/trove-demo/home TROVE_BUCKET_DIR=/tmp/trove-demo/bucket
 ```
 
+## Operator runbooks
+
+Step-by-step CLI workflows (happy path, resume/recovery, known limitations) live
+in [`docs/runbook/`](docs/runbook/README.md) — one runbook per command family
+(`archive`, `import`, `query`, `playlist`, `volume`, `sync`).
+
 ## Config runbook
 
 `config.toml` tells Trove **where the durable bucket lives**. If no config file
