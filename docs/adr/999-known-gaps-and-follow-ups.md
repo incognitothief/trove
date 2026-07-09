@@ -65,12 +65,55 @@ it.
 
 ---
 
-## Archive / storage
+## Tag extraction and index metadata (ADR 002 / ADR 004)
+
+**Decision for now:** defer real tag extraction until **after** the initial archive
+backfill. Backfill is not blocked — audio objects and embedded tags are preserved
+in the bucket; only Trove’s **index metadata** is thin today.
+
+### What we have today
+
+| Layer | Behavior |
+| --- | -------- |
+| **Import commit** | `StubExtractor` only: title from filename stem, `file_type` from extension. No artist, album, BPM, key, or embedded artwork read into the index. |
+| **Bucket objects** | Content-addressed bytes (`music/<sha256>.<ext>`). **Embedded ID3/Vorbis/etc. tags stay in the file** — sync copies bytes unchanged. |
+| **Archive index** | `archive.sqlite` + `archive-index.jsonl` carry sparse `metadata` on each `ArchiveEntry`. |
+| **Export / USB layout** | Folder paths use index metadata → often `Unknown Artist/Unknown Album/` until extraction lands. |
+| **Mixxx / other players** | Read **embedded tags from the file**, not Trove’s index — so UI can look correct even when Trove’s DB is sparse. |
+
+### What “backfill metadata later” means
+
+This is **index enrichment**, not re-upload:
+
+1. For each `ArchiveEntry` (by `track_id` / `sha256`), read tags from:
+   - **Preferred:** original local path (`source_path_original`) if the library is still mounted, or
+   - **Fallback:** download the object from the bucket and parse in place / temp file.
+2. Run a real extractor (planned: `lofty` or similar behind `MetadataExtractor`).
+3. **`ArchiveDb::upsert`** — update `metadata`, optionally `artwork_object_key`, tags.
+4. **`push_index`** — advance canonical `archive-index.jsonl` + `schema-version.json`.
+
+Objects in S3 **do not change** if `sha256` is unchanged. `track_id` stays stable.
+
+### Scope when implemented (post-backfill)
+
+| In scope | Out of scope for v1 extractor |
+| --- | --- |
+| artist, album, title, year, genre from tags | BPM/key analysis (analyzer / ADR 002) |
+| duration, comment where present | Mixxx DB import/export |
+| optional embedded cover → `artwork_object_key` or sidecar policy | Re-encoding or rewriting audio tags on export |
+| forward path: extract on **new** imports at commit time | |
+
+### Operator impact until then
+
+- **`trove query --artist` / `--album`** — unreliable; don’t depend on them for migration QA.
+- **USB folder names** — may not match tags; Mixxx display can still be correct.
+- **Archive safety** — unaffected; dedupe and resume work on content hash.
+
+### Related gaps (same phase)
 
 | Gap | Notes |
 | --- | ----- |
-| Compare-and-swap on `schema-version.json` | Concurrent importers can race (ADR 001 follow-up). |
-| Real metadata extraction | Stub extractor only; weak artist/album folders on export. |
+| Compare-and-swap on `schema-version.json` | Concurrent importers / backfill jobs can race on index push (ADR 001 follow-up). |
 | Streaming / disk-backed `ObjectStore::put` | Import reads whole files into memory before upload. |
 | Async core or blocking-native S3 client | Sync-over-async bridge smell (ADR 003 §2). |
 
@@ -90,3 +133,4 @@ it.
 | Date | Change |
 | --- | --- |
 | 2026-07-08 | Created ADR 999. Added playlist `show` gap and runbooks-for-all-command-sets note. Seeded from ADR 001–006 and recent implementation work. |
+| 2026-07-08 | Added tag extraction / metadata backfill section: defer until after archive backfill; index enrichment via upsert + push_index without re-upload. |
