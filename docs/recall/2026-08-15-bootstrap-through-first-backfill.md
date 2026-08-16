@@ -180,3 +180,87 @@ treat the initial backfill as closed:
 
 After that, product work returns to the deferred lane (metadata/analyzers,
 export/USB polish, ADR 999 items) — not another full-library backfill.
+
+---
+
+## Cross-reference (desktop, 2026-08-15)
+
+> **DISCLAIMER — MACHINE OF ORIGIN:** This section was written on the
+> **desktop computer** after the laptop addendum was merged into this note and
+> `feature/scripting` was merged into `feature/recall`. It does not replace
+> either perspective above. Local job counts, `~/.trove`, and T72 paths remain
+> **host-specific**. The bucket was **not** queried for this recap.
+
+- **Date recorded:** 2026-08-15
+- **Kind:** cross-machine recap of the same backfill episode + scripting merge
+- **Machine of origin:** desktop computer
+- **Repo state:** `feature/recall` includes `origin/feature/scripting`
+  (`b9baafa` scripts, `197f6ef` script enhancements)
+
+This is one episode seen from two machines, not two separate backfills.
+
+### Two perspectives of the same episode
+
+| | Desktop (this machine) | Laptop |
+| --- | --- | --- |
+| When | 2026-07-07 through 2026-07-09 | 2026-07-08 through 2026-07-10 (confirmed 2026-08-15) |
+| What happened | First import hit silent local-simulator fallback; internal SSD filled; `~/.trove` was **trashed** | Restarted against real S3; batch-walked artist folders on T72; overnight run through `yves-tumor` |
+| Local evidence | Discarded. This desktop has no surviving import-job DB from that attempt | Laptop `~/.trove`: 623 jobs `done`, 1 job in `commit` (`Teebs`, 25 files `verified`), 7,640 tracks in `archive.sqlite` |
+| Stated next action then | Restart the whole-library backfill with valid `name` + `region` | Do **not** restart; commit job `53769506-2355-4660-87df-9f1077ae549f` |
+
+From the desktop's July 9 vantage, restarting was the right next step. From
+the laptop's later vantage, that restart already ran. The laptop work is the
+**offline continuation** the desktop never saw.
+
+### What `feature/scripting` actually added
+
+Merged here without executing it:
+
+- `scripts/import-batch.sh` — one one-shot `bin/trove import` per **immediate**
+  subdirectory of a parent path (C-locale sort). Failures are logged; the walk
+  continues. That matches the laptop story that Teebs could stall at commit
+  while later folders still finished.
+- Resume is path-based: `--from PATH` (inclusive) / `--after PATH` (exclusive).
+  The later enhancement (`197f6ef`) requires a **canonical full path** that is
+  a direct child of the parent, not a basename.
+- Runbook 00: `CARGO_FEATURES=s3` must be set **at invoke time** for
+  `bin/trove` / the batch script. A prior `make build CARGO_FEATURES=s3` is not
+  enough.
+- Runbook 02: documents the batch helper as the glob/multi-folder workaround.
+
+### Speculative reading (do not treat as bucket truth)
+
+Local SQLite (`archive.sqlite`, `sync.sqlite`) is a **best-effort cache**.
+Reads are supposed to reconcile against the bucket; this recap did **not**
+call `archive pull-index` or inspect S3. Until the cloud index is checked:
+
+- The laptop's 7,640 committed / 623-done figures **might** match the bucket,
+  or they might be ahead, behind, or host-only. They are not canonical.
+- The Teebs job at `commit` with 25 `verified` files **might** mean those
+  objects are already in staging (or even `music/`) and only the local index
+  push is unfinished — or the job never landed remotely. Unknown without the
+  bucket.
+- Desktop `~/.trove` was discarded, so this machine cannot confirm or deny the
+  laptop counts. Rehydrating this desktop would mean pulling the **bucket**
+  index, not copying the laptop DB.
+- Re-running `import-batch.sh` over folders the laptop already committed
+  **should** be safe via SHA-256 dedupe **if** those objects are in the
+  archive; that "if" is exactly what we have not verified.
+
+### Next action (desktop view, still speculative)
+
+Do **not** start another full-library backfill from this desktop on the
+strength of either note. The likely operator step, after a bucket check (not
+done here), is:
+
+1. Reconcile this machine from the cloud (`archive pull-index` with
+   `CARGO_FEATURES=s3`) — trust that over any host SQLite.
+2. If the bucket agrees Teebs is the hole, finish that job from a machine
+   that still has the job id in `sync.sqlite` (probably the laptop), or
+   re-import `/Volumes/T72/music/library/Teebs` and let dedupe no-op the rest.
+3. Only then treat the initial backfill as closed and return to ADR 999
+   follow-ups.
+
+Related: [Import runbook — batch](../runbook/02-import.md#batch-import-multiple-folders),
+[ADR 000 — bucket is source of truth](../adr/000-bootstrap.md),
+[ADR 999](../adr/999-known-gaps-and-follow-ups.md).

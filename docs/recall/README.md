@@ -29,4 +29,4 @@ was. It is not a status checklist and it is not architecture.
 
 | Note | Session |
 | --- | --- |
-| [2026-08-15-bootstrap-through-first-backfill.md](2026-08-15-bootstrap-through-first-backfill.md) | Desktop: genesis through failed first backfill. Laptop addendum: S3 batch backfill ~done; Teebs commit still open |
+| [2026-08-15-bootstrap-through-first-backfill.md](2026-08-15-bootstrap-through-first-backfill.md) | Same backfill episode, two machines: desktop failed local-sim import; laptop S3 batch (~Teebs uncommitted). Desktop cross-reference + `feature/scripting` merge; bucket not queried |
