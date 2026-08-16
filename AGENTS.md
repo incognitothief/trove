@@ -56,8 +56,10 @@ what lets a fix land once and surface everywhere.
   into internals.
 - Before finishing: build, test, and lint must be clean. Use `make help` for the
   exact targets — all are expected to stay green.
-- Record consequential decisions as a **new** ADR; don't rewrite old ones. Leave
-  a short, honest trail of what's real vs. deferred.
+- Record consequential decisions as a **new** ADR; don't rewrite old ones —
+  except [ADR 999](docs/adr/999-known-gaps-and-follow-ups.md), the living gaps
+  backlog, which is meant to be edited in place. Leave a short, honest trail of
+  what's real vs. deferred.
 - **Episodic memory is opt-in.** Write to `docs/recall/` only when the user
   prompts it (for example "record this in Recall"). Never create or update a
   Recall note unprompted.
@@ -67,7 +69,11 @@ what lets a fix land once and surface everywhere.
 Don't trust a checklist in this file — it rots. Instead:
 
 - `grep` for the "not implemented" marker to find live stubs and seams.
-- The most recent ADR tracks current status and prioritized follow-ups.
+- [ADR 999](docs/adr/999-known-gaps-and-follow-ups.md) is the living backlog —
+  not a numbered decision, never superseded, always edited in place. Keep it
+  honest: closing a gap means striking its row with a pointer to the ADR/commit
+  that closed it, not leaving it to rot; opening one means a new row with a
+  pointer, not a design write-up. Every edit gets a dated Changelog line.
 
 ## Dev workflow
 
