@@ -15,8 +15,11 @@ was. It is not a status checklist and it is not architecture.
 
 ## How to use
 
-- Add one note per session (or per recap) when the work is worth remembering
-  across chats.
+- **Write only when the user asks.** Agents must not auto-record a session,
+  recap, or next-action note. A Recall file is created or updated only on an
+  explicit prompt.
+- Add one note per prompted recap when the work is worth remembering across
+  chats.
 - Prefer dated filenames: `YYYY-MM-DD-short-slug.md`.
 - Write what a future session needs: context, outcome, next action. Point at
   ADRs and runbooks instead of duplicating them.
