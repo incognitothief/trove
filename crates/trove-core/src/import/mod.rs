@@ -680,6 +680,10 @@ pub fn verify(
 }
 
 /// Promote verified staging objects into `music/` and produce archive entries.
+// `library_root` is one more optional context param alongside `archive`/`db`
+// — see the same justification on `plan()` for why this isn't bundled into
+// a context struct.
+#[allow(clippy::too_many_arguments)]
 pub fn commit(
     job: &mut ImportJob,
     store: &dyn ObjectStore,
@@ -687,6 +691,7 @@ pub fn commit(
     archive: &ArchiveDb,
     extractor: &dyn MetadataExtractor,
     db: Option<&ImportDb>,
+    library_root: Option<&Path>,
     progress: &mut dyn ImportProgress,
 ) -> Result<Vec<ArchiveEntry>> {
     job.phase = Phase::Commit;
@@ -750,6 +755,8 @@ pub fn commit(
         let track_id = TrackId::new();
         let now = Utc::now();
         let metadata = extractor.extract(&file.path).unwrap_or_default();
+        let library_relative_path =
+            library_root.and_then(|root| crate::library::compute_slug(root, &file.path));
         committed.push(ArchiveEntry {
             track_id: track_id.clone(),
             object_key: music_key.clone(),
@@ -761,6 +768,7 @@ pub fn commit(
             updated_at: now,
             source_path_original: Some(file.path.display().to_string()),
             artwork_object_key: None,
+            library_relative_path,
         });
 
         file.object_key = Some(music_key);

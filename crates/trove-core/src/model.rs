@@ -73,6 +73,16 @@ pub struct ArchiveEntry {
     pub updated_at: DateTime<Utc>,
     pub source_path_original: Option<String>,
     pub artwork_object_key: Option<String>,
+    /// Portable identity: this file's path relative to the declared library
+    /// root, in canonical form (ADR 007, Group D2) — `/`-separated, no
+    /// leading slash, NFC-normalized. Distinct from `source_path_original`,
+    /// which stays the absolute, single-machine, one-shot snapshot; this is
+    /// what recognizes "the same library, remounted somewhere else" across
+    /// drives. `None` when no library root was declared at commit time (or
+    /// for entries committed before this field existed — additive, not
+    /// backfilled automatically; see `library::backfill_slugs`, Group D2a).
+    #[serde(default)]
+    pub library_relative_path: Option<String>,
 }
 
 /// A logical Trove playlist/crate (not yet a Mixxx playlist).

@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS tracks (
     imported_at          TEXT NOT NULL,
     updated_at           TEXT NOT NULL,
     source_path_original TEXT,
-    artwork_object_key   TEXT
+    artwork_object_key   TEXT,
+    library_relative_path TEXT   -- ADR 007 Group D2; also backfilled via ensure_column for pre-existing DBs
 );
 
 CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist);

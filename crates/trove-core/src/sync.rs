@@ -514,6 +514,7 @@ mod tests {
             updated_at: now,
             source_path_original: None,
             artwork_object_key: None,
+            library_relative_path: None,
         }
     }
 

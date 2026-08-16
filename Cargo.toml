@@ -39,6 +39,10 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
+# NFC normalization for the cross-drive library-relative-path slug (ADR 007
+# Group D2) -- without it, a macOS/APFS NFD-decomposed filename and the same
+# logical path elsewhere produce byte-different slugs.
+unicode-normalization = "0.1"
 
 # CLI
 clap = { version = "4", features = ["derive"] }

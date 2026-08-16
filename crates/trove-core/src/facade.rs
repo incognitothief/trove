@@ -538,6 +538,7 @@ impl Trove {
             &self.archive,
             self.extractor.as_ref(),
             Some(&self.import_db),
+            self.library_root(),
             progress,
         )?;
         for entry in &committed {
@@ -639,6 +640,7 @@ impl Trove {
             &self.archive,
             self.extractor.as_ref(),
             Some(&self.import_db),
+            self.library_root(),
             progress,
         )?;
         for entry in &committed {

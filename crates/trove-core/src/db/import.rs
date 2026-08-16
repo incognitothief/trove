@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 
-use super::{open_in_memory, open_with_schema, schema};
+use super::{ensure_column, open_in_memory, open_with_schema, schema};
 use crate::error::{Error, Result};
 use crate::import::{
     ArtworkCandidate, FileState, ImportJob, ImportOptions, ImportStats, Phase, PlannedFile,
@@ -503,20 +503,6 @@ fn decode_artwork_paths(json: Option<String>) -> Result<Vec<PathBuf>> {
     }
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    for col in cols {
-        if col? == column {
-            return Ok(());
-        }
-    }
-    conn.execute(
-        &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
-        [],
-    )?;
-    Ok(())
-}
 
 #[derive(Serialize, Deserialize)]
 struct ArtworkCandidateRow {

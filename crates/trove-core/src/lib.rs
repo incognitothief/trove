@@ -18,6 +18,8 @@
 //! - [`volume`] — removable performance volumes.
 //! - [`sync`] — resumable transfer/export planning.
 //! - [`import`] — resumable, crash-safe bulk import.
+//! - [`library`] — the declared library root and what's anchored to it:
+//!   cross-drive identity, the shape scan, the backfill Plan.
 //! - [`facade`] — the [`Trove`] entry point clients drive.
 
 pub mod archive;
@@ -26,6 +28,7 @@ pub mod db;
 pub mod error;
 pub mod facade;
 pub mod import;
+pub mod library;
 pub mod metadata;
 pub mod model;
 pub mod playlist;
@@ -81,6 +84,7 @@ mod tests {
             updated_at: now,
             source_path_original: None,
             artwork_object_key: None,
+            library_relative_path: None,
         }
     }
 
@@ -395,6 +399,44 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].object_key, format!("music/{sha}.mp3"));
         assert_eq!(results[0].sha256, sha);
+    }
+
+    #[test]
+    fn commit_records_library_relative_path_only_when_a_root_is_declared() {
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Theo Parrish")).unwrap();
+        std::fs::write(
+            library.path().join("Theo Parrish/Track.mp3"),
+            b"audio-bytes",
+        )
+        .unwrap();
+
+        // No library root declared: stays None, same as before this unit.
+        let mut trove_no_root = Trove::in_memory(test_config()).unwrap();
+        let mut progress = NoopImportProgress;
+        let (_, committed) = trove_no_root
+            .import_run_full(library.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+        assert_eq!(committed, 1);
+        let results = trove_no_root.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(results[0].library_relative_path, None);
+
+        // Library root declared: the slug is computed relative to it, not
+        // to whatever path this particular `import` call used.
+        let home = tempfile::tempdir().unwrap();
+        let mut trove_with_root =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+        trove_with_root.set_library_root(library.path()).unwrap();
+        let (_, committed) = trove_with_root
+            .import_run_full(library.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+        assert_eq!(committed, 1);
+        let results = trove_with_root.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(
+            results[0].library_relative_path.as_deref(),
+            Some("Theo Parrish/Track.mp3")
+        );
     }
 
     #[test]

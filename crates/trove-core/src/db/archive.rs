@@ -8,7 +8,7 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, types::Value, Connection, Row};
 
-use super::{open_in_memory, open_with_schema, schema};
+use super::{ensure_column, open_in_memory, open_with_schema, schema};
 use crate::error::Result;
 use crate::model::{ArchiveEntry, Metadata, TrackId};
 use crate::query::QuerySpec;
@@ -21,16 +21,16 @@ pub struct ArchiveDb {
 impl ArchiveDb {
     /// Open (creating if needed) the archive database at `path`.
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(ArchiveDb {
-            conn: open_with_schema(path, schema::ARCHIVE_SCHEMA)?,
-        })
+        let conn = open_with_schema(path, schema::ARCHIVE_SCHEMA)?;
+        migrate_archive_schema(&conn)?;
+        Ok(ArchiveDb { conn })
     }
 
     /// Open an ephemeral in-memory archive database (tests).
     pub fn in_memory() -> Result<Self> {
-        Ok(ArchiveDb {
-            conn: open_in_memory(schema::ARCHIVE_SCHEMA)?,
-        })
+        let conn = open_in_memory(schema::ARCHIVE_SCHEMA)?;
+        migrate_archive_schema(&conn)?;
+        Ok(ArchiveDb { conn })
     }
 
     /// The reconcile generation this cache was last hydrated to, if any.
@@ -70,10 +70,11 @@ impl ArchiveDb {
                 track_id, object_key, size_bytes, sha256,
                 title, artist, album, genre, year, bpm, key_camelot,
                 duration_secs, comment, file_type, tags,
-                imported_at, updated_at, source_path_original, artwork_object_key
+                imported_at, updated_at, source_path_original, artwork_object_key,
+                library_relative_path
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19
+                ?15, ?16, ?17, ?18, ?19, ?20
              )
              ON CONFLICT(track_id) DO UPDATE SET
                 object_key = excluded.object_key,
@@ -92,7 +93,8 @@ impl ArchiveDb {
                 tags = excluded.tags,
                 updated_at = excluded.updated_at,
                 source_path_original = excluded.source_path_original,
-                artwork_object_key = excluded.artwork_object_key",
+                artwork_object_key = excluded.artwork_object_key,
+                library_relative_path = excluded.library_relative_path",
             params![
                 entry.track_id.0,
                 entry.object_key,
@@ -113,6 +115,7 @@ impl ArchiveDb {
                 entry.updated_at.to_rfc3339(),
                 entry.source_path_original,
                 entry.artwork_object_key,
+                entry.library_relative_path,
             ],
         )?;
         Ok(())
@@ -135,10 +138,11 @@ impl ArchiveDb {
                         track_id, object_key, size_bytes, sha256,
                         title, artist, album, genre, year, bpm, key_camelot,
                         duration_secs, comment, file_type, tags,
-                        imported_at, updated_at, source_path_original, artwork_object_key
+                        imported_at, updated_at, source_path_original, artwork_object_key,
+                        library_relative_path
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                        ?14, ?15, ?16, ?17, ?18, ?19
+                        ?14, ?15, ?16, ?17, ?18, ?19, ?20
                      )",
                     params![
                         entry.track_id.0,
@@ -160,6 +164,7 @@ impl ArchiveDb {
                         entry.updated_at.to_rfc3339(),
                         entry.source_path_original,
                         entry.artwork_object_key,
+                        entry.library_relative_path,
                     ],
                 )?;
             }
@@ -192,6 +197,23 @@ impl ArchiveDb {
             )
             .ok();
         entry.transpose()
+    }
+
+    /// Fetch every entry sharing the given library-relative-path slug (ADR
+    /// 007, Group D2) — plural, since two unrelated libraries could
+    /// coincidentally share a catalog position, so this is always a
+    /// candidate set for the caller to corroborate further (e.g. by size),
+    /// never a single trusted answer on its own.
+    pub fn find_by_relative_path(&self, slug: &str) -> Result<Vec<ArchiveEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM tracks WHERE library_relative_path = ?1"
+        ))?;
+        let rows = stmt.query_map(params![slug], row_to_entry)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row??);
+        }
+        Ok(out)
     }
 
     /// Fetch a single entry by id.
@@ -275,7 +297,21 @@ impl ArchiveDb {
 
 const COLUMNS: &str = "track_id, object_key, size_bytes, sha256, title, artist, \
      album, genre, year, bpm, key_camelot, duration_secs, comment, file_type, \
-     tags, imported_at, updated_at, source_path_original, artwork_object_key";
+     tags, imported_at, updated_at, source_path_original, artwork_object_key, \
+     library_relative_path";
+
+/// Idempotently add the `library_relative_path` column (ADR 007, Group D2)
+/// to an already-existing `archive.sqlite` — same pattern as
+/// `migrate_import_schema`/`migrate_transfer_schema`, via the shared
+/// `ensure_column` helper.
+fn migrate_archive_schema(conn: &Connection) -> Result<()> {
+    ensure_column(conn, "tracks", "library_relative_path", "TEXT")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_tracks_library_relative_path \
+         ON tracks(library_relative_path);",
+    )?;
+    Ok(())
+}
 
 fn like(s: &str) -> String {
     format!("%{s}%")
@@ -317,6 +353,7 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<Result<ArchiveEntry>> {
             updated_at,
             source_path_original: row.get("source_path_original")?,
             artwork_object_key: row.get("artwork_object_key")?,
+            library_relative_path: row.get("library_relative_path")?,
         })
     })())
 }
@@ -325,4 +362,54 @@ fn parse_dt(s: String) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(&s)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Metadata;
+
+    fn entry(id: &str, slug: Option<&str>) -> ArchiveEntry {
+        let now = Utc::now();
+        ArchiveEntry {
+            track_id: TrackId::from(id),
+            object_key: format!("music/{id}.mp3"),
+            size_bytes: 100,
+            sha256: format!("sha-{id}"),
+            metadata: Metadata::default(),
+            tags: Vec::new(),
+            imported_at: now,
+            updated_at: now,
+            source_path_original: None,
+            artwork_object_key: None,
+            library_relative_path: slug.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn find_by_relative_path_returns_only_matching_entries() {
+        let db = ArchiveDb::in_memory().unwrap();
+        db.upsert(&entry("a", Some("Artist/Track.mp3"))).unwrap();
+        db.upsert(&entry("b", Some("Other/Track.mp3"))).unwrap();
+        db.upsert(&entry("c", None)).unwrap();
+
+        let found = db.find_by_relative_path("Artist/Track.mp3").unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].track_id, TrackId::from("a"));
+
+        assert!(db.find_by_relative_path("Nonexistent.mp3").unwrap().is_empty());
+    }
+
+    #[test]
+    fn find_by_relative_path_returns_every_coincidental_collision() {
+        // Two unrelated libraries could coincidentally share a catalog
+        // position — this must return a candidate set, not silently pick
+        // one, so callers can corroborate further (e.g. by size).
+        let db = ArchiveDb::in_memory().unwrap();
+        db.upsert(&entry("a", Some("Various/Intro.mp3"))).unwrap();
+        db.upsert(&entry("b", Some("Various/Intro.mp3"))).unwrap();
+
+        let found = db.find_by_relative_path("Various/Intro.mp3").unwrap();
+        assert_eq!(found.len(), 2);
+    }
 }

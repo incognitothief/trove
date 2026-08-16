@@ -36,3 +36,23 @@ pub fn open_in_memory(schema: &str) -> Result<Connection> {
     conn.execute_batch(schema)?;
     Ok(conn)
 }
+
+/// Idempotently add `column` to `table` if it doesn't already exist — the
+/// shared building block every per-database `migrate_*_schema` function uses
+/// so an older on-disk database picks up new columns without a real
+/// migration system. Previously duplicated verbatim in `import.rs` and
+/// `transfer.rs`; consolidated here rather than adding a third copy.
+pub(crate) fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for col in cols {
+        if col? == column {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {ddl}"),
+        [],
+    )?;
+    Ok(())
+}
