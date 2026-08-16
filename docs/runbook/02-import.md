@@ -113,11 +113,13 @@ Two cases:
 
 **1. A folder finished cleanly; you want the next folder onward**
 
-Use `--after` with the **basename** of the last folder that completed (not the
-full path):
+Use `--after` with the **full path** to the last folder that completed. Copy it
+from the `[N/total] importing …` line in your terminal output:
 
 ```bash
-CARGO_FEATURES=s3 scripts/import-batch.sh --after "1600J" /Volumes/T72/music/library
+CARGO_FEATURES=s3 scripts/import-batch.sh \
+  --after "/Volumes/T72/music/library/1600J" \
+  /Volumes/T72/music/library
 ```
 
 **2. A folder died mid-import (Ctrl-C, crash, error)**
@@ -135,7 +137,9 @@ Then either `--after` that folder, or `--from` the folder that failed if you
 want to re-run it from scratch:
 
 ```bash
-CARGO_FEATURES=s3 scripts/import-batch.sh --after "Broken Artist" /Volumes/T72/music/library
+CARGO_FEATURES=s3 scripts/import-batch.sh \
+  --after "/Volumes/T72/music/library/Broken Artist" \
+  /Volumes/T72/music/library
 ```
 
 Re-running folders that already committed is safe (files show as `duplicate`)

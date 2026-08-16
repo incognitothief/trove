@@ -9,7 +9,7 @@
 # Usage:
 #   CARGO_FEATURES=s3 scripts/import-batch.sh <parent-dir>    # real S3 bucket
 #   scripts/import-batch.sh <parent-dir>                      # local simulator
-#   scripts/import-batch.sh --after <folder> <parent-dir>     # resume batch
+#   scripts/import-batch.sh --after <folder-path> <parent-dir>     # resume batch
 #   scripts/import-batch.sh <parent-dir> -- [--include-dotfiles] [--no-artwork] …
 #
 # Arguments after `--` are forwarded to every `bin/trove import` call.
@@ -23,18 +23,18 @@ TROVE="$ROOT/bin/trove"
 
 usage() {
   cat <<'EOF'
-Usage: scripts/import-batch.sh [--from NAME] [--after NAME] <parent-dir> [-- trove-import-args…]
+Usage: scripts/import-batch.sh [--from PATH] [--after PATH] <parent-dir> [-- trove-import-args…]
 
 Run bin/trove import once per immediate subdirectory of <parent-dir>.
 Folders are processed in C locale sort order (byte-wise, usually alphabetical).
 
-Resume options (match folder basename under <parent-dir>):
-  --from NAME   start at NAME (inclusive); re-import if it failed mid-job
-  --after NAME  skip through NAME (exclusive); use when NAME finished cleanly
+Resume options (PATH must be a direct subdirectory of <parent-dir>):
+  --from PATH   start at PATH (inclusive); re-import if it failed mid-job
+  --after PATH  skip through PATH (exclusive); use when PATH finished cleanly
 
 Examples:
   CARGO_FEATURES=s3 scripts/import-batch.sh ~/Music/DJ-Crates
-  CARGO_FEATURES=s3 scripts/import-batch.sh --after 1600J /Volumes/T72/music/library
+  CARGO_FEATURES=s3 scripts/import-batch.sh --after ~/Music/library/1600J ~/Music/library
   scripts/import-batch.sh ~/Music/DJ-Crates -- --no-artwork
 
 Exit code is the number of failed imports (capped at 125).
@@ -42,9 +42,25 @@ EOF
 }
 
 parent=""
-start_from_name=""
-start_after_name=""
+start_from_path=""
+start_after_path=""
 trove_args=()
+
+canonical_dir() {
+  if [ ! -d "$1" ]; then
+    echo "error: not a directory: $1" >&2
+    exit 1
+  fi
+  (cd -- "$1" && pwd)
+}
+
+validate_anchor() {
+  local anchor="$1"
+  if [ "$(dirname "$anchor")" != "$parent" ]; then
+    echo "error: $anchor is not a direct subdirectory of $parent" >&2
+    exit 1
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -53,13 +69,13 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --from)
-      [ $# -ge 2 ] || { echo "error: --from requires a folder name" >&2; exit 1; }
-      start_from_name="$2"
+      [ $# -ge 2 ] || { echo "error: --from requires a folder path" >&2; exit 1; }
+      start_from_path="$(canonical_dir "$2")"
       shift 2
       ;;
     --after)
-      [ $# -ge 2 ] || { echo "error: --after requires a folder name" >&2; exit 1; }
-      start_after_name="$2"
+      [ $# -ge 2 ] || { echo "error: --after requires a folder path" >&2; exit 1; }
+      start_after_path="$(canonical_dir "$2")"
       shift 2
       ;;
     --)
@@ -89,9 +105,17 @@ if [ -z "$parent" ]; then
   exit 1
 fi
 
-if [ -n "$start_from_name" ] && [ -n "$start_after_name" ]; then
+if [ -n "$start_from_path" ] && [ -n "$start_after_path" ]; then
   echo "error: use only one of --from or --after" >&2
   exit 1
+fi
+
+if [ -n "$start_from_path" ]; then
+  validate_anchor "$start_from_path"
+fi
+
+if [ -n "$start_after_path" ]; then
+  validate_anchor "$start_after_path"
 fi
 
 if [ ! -x "$TROVE" ]; then
@@ -129,23 +153,21 @@ import_dirs=()
 resume=false
 past_after=false
 
-if [ -z "$start_from_name" ] && [ -z "$start_after_name" ]; then
+if [ -z "$start_from_path" ] && [ -z "$start_after_path" ]; then
   resume=true
 fi
 
 for dir in "${dirs[@]}"; do
-  base="$(basename "$dir")"
-
   if [ "$resume" = false ]; then
-    if [ -n "$start_from_name" ]; then
-      if [ "$base" = "$start_from_name" ]; then
+    if [ -n "$start_from_path" ]; then
+      if [ "$dir" = "$start_from_path" ]; then
         resume=true
       else
         continue
       fi
-    elif [ -n "$start_after_name" ]; then
+    elif [ -n "$start_after_path" ]; then
       if [ "$past_after" = false ]; then
-        [ "$base" = "$start_after_name" ] && past_after=true
+        [ "$dir" = "$start_after_path" ] && past_after=true
         continue
       fi
     fi
@@ -154,13 +176,13 @@ for dir in "${dirs[@]}"; do
   import_dirs+=("$dir")
 done
 
-if [ -n "$start_from_name" ] && [ "$resume" = false ]; then
-  echo "error: --from folder not found under $parent: $start_from_name" >&2
+if [ -n "$start_from_path" ] && [ "$resume" = false ]; then
+  echo "error: --from folder not found in batch list: $start_from_path" >&2
   exit 1
 fi
 
-if [ -n "$start_after_name" ] && [ "$past_after" = false ]; then
-  echo "error: --after folder not found under $parent: $start_after_name" >&2
+if [ -n "$start_after_path" ] && [ "$past_after" = false ]; then
+  echo "error: --after folder not found in batch list: $start_after_path" >&2
   exit 1
 fi
 
@@ -173,10 +195,10 @@ fi
 failed=0
 failures=()
 
-if [ -n "$start_from_name" ]; then
-  echo "import-batch: resuming from $start_from_name ($total folder(s) remaining)"
-elif [ -n "$start_after_name" ]; then
-  echo "import-batch: resuming after $start_after_name ($total folder(s) remaining)"
+if [ -n "$start_from_path" ]; then
+  echo "import-batch: resuming from $start_from_path ($total folder(s) remaining)"
+elif [ -n "$start_after_path" ]; then
+  echo "import-batch: resuming after $start_after_path ($total folder(s) remaining)"
 else
   echo "import-batch: $total folder(s) under $parent"
 fi
