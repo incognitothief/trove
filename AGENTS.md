@@ -11,6 +11,9 @@ code, the ADRs, or `make help` instead.
 - **Read the ADRs in `docs/adr/`.** They are the source of truth for the
   architecture and the running record of decisions. Read in order; the latest
   ones describe current state and open follow-ups.
+- **Read `docs/recall/`** for episodic session memory — what actually happened
+  last, what failed, and the next action. It is not architecture; ADRs still win
+  on decisions.
 - **Discover the structure, don't memorize it.** Skim the tree and run
   `make help`. Any map written here would go stale — explore instead.
 
