@@ -82,6 +82,75 @@ bin/trove import commit <job-id>
 `plan` output shows per-file state (`pending`, `duplicate`, etc.) and cover-art
 candidates.
 
+## Batch import (multiple folders)
+
+Trove has no built-in globbing or batch import. For a tree of sibling folders
+(e.g. one crate per year under `~/Music/DJ-Crates/`), use the helper script:
+
+```bash
+CARGO_FEATURES=s3 scripts/import-batch.sh ~/Music/DJ-Crates
+```
+
+For a local filesystem bucket (`region = "local"`), omit `CARGO_FEATURES=s3`.
+
+The script runs one **one-shot** import per **immediate subdirectory** (not
+recursive). Each folder gets the full `scan → upload → verify → commit` cycle.
+Progress prints as `[N/total] importing …`; failures are logged and the script
+continues with the remaining folders.
+
+Forward import flags to every invocation:
+
+```bash
+scripts/import-batch.sh ~/Music/DJ-Crates -- --no-artwork
+```
+
+Exit code is the number of failed folders (0 when all succeed). Folders are
+processed in C locale sort order (byte-wise, usually alphabetical).
+
+### Resume a batch run
+
+Two cases:
+
+**1. A folder finished cleanly; you want the next folder onward**
+
+Use `--after` with the **full path** to the last folder that completed. Copy it
+from the `[N/total] importing …` line in your terminal output:
+
+```bash
+CARGO_FEATURES=s3 scripts/import-batch.sh \
+  --after "/Volumes/T72/music/library/1600J" \
+  /Volumes/T72/music/library
+```
+
+**2. A folder died mid-import (Ctrl-C, crash, error)**
+
+Finish that folder's job first, then continue the batch:
+
+```bash
+CARGO_FEATURES=s3 bin/trove import list
+CARGO_FEATURES=s3 bin/trove import status <job-id>
+CARGO_FEATURES=s3 bin/trove import resume <job-id>
+CARGO_FEATURES=s3 bin/trove import commit <job-id>
+```
+
+Then either `--after` that folder, or `--from` the folder that failed if you
+want to re-run it from scratch:
+
+```bash
+CARGO_FEATURES=s3 scripts/import-batch.sh \
+  --after "/Volumes/T72/music/library/Broken Artist" \
+  /Volumes/T72/music/library
+```
+
+Re-running folders that already committed is safe (files show as `duplicate`)
+but wastes time — prefer `--after` when you know the last success.
+
+For a single deep tree, import the parent path directly instead:
+
+```bash
+bin/trove import ~/Music/DJ-Crates/2024
+```
+
 ## Resume and recovery
 
 ### Interrupted one-shot import
@@ -155,6 +224,7 @@ Progress events are suppressed in `--json` mode (no stderr progress lines).
 
 | Topic | Status |
 | --- | --- |
+| Glob / native batch import | Use `scripts/import-batch.sh` for sibling folders |
 | Rich metadata (artist, album, BPM) | `StubExtractor` — title from filename only |
 | Mid-file multipart resume | Whole file re-uploaded on retry |
 | Import manifest in bucket | Local `~/.trove/cache/manifests/` only |
