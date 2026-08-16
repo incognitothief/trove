@@ -139,6 +139,30 @@ impl Trove {
         Ok(())
     }
 
+    /// One-time, local, offline backfill of `library_relative_path` for
+    /// content archived before a library root existed or was declared (ADR
+    /// 007, Group D2a). No re-read, no re-hash, no re-upload of any audio —
+    /// purely a metadata pass over `source_path_original`, already recorded
+    /// at commit time. Pushes the updated index once, only if anything was
+    /// actually backfilled.
+    pub fn backfill_slugs(&mut self, allow_offline: bool) -> Result<crate::library::BackfillSlugsReport> {
+        let root = self.library_root().map(|p| p.to_path_buf()).ok_or_else(|| {
+            crate::error::Error::config(
+                "no library root declared — set one with `trove library root --set <path>` first",
+            )
+        })?;
+        self.reconcile(allow_offline)?;
+        let entries = self.archive.all()?;
+        let (to_update, report) = crate::library::plan_slug_backfill(&root, &entries);
+        for entry in &to_update {
+            self.archive.upsert(entry)?;
+        }
+        if !to_update.is_empty() {
+            self.push_index()?;
+        }
+        Ok(report)
+    }
+
     /// Reconcile, then check every indexed entry actually has a
     /// correctly-sized object in the bucket. `deep` re-downloads and
     /// re-hashes every object instead of only checking presence/size — a

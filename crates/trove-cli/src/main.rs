@@ -65,6 +65,11 @@ enum LibraryCmd {
         #[arg(long, value_name = "PATH")]
         set: Option<String>,
     },
+    /// One-time backfill of the cross-drive identity slug for content
+    /// archived before a library root was declared (ADR 007, Group D2a).
+    /// Local and offline-by-nature (no re-read/re-hash/re-upload) except for
+    /// the reconcile and final index push.
+    BackfillSlugs,
 }
 
 #[derive(Subcommand)]
@@ -262,12 +267,11 @@ fn run(cli: &Cli) -> Result<()> {
 }
 
 fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
-    // Deliberately does NOT go through runtime::open_trove(): declaring or
-    // reading the library root is a pure local-config operation and must
-    // not require a live bucket connection (no S3 credentials, no network,
-    // no `--features s3` build) just to run — unlike every other command
-    // here, which legitimately needs an open Trove.
     match cmd {
+        // Deliberately does NOT go through runtime::open_trove(): declaring
+        // or reading the library root is a pure local-config operation and
+        // must not require a live bucket connection (no S3 credentials, no
+        // network, no `--features s3` build) just to run.
         LibraryCmd::Root { set } => {
             let config_path = runtime::trove_home()?.join("config.toml");
             if let Some(path) = set {
@@ -301,6 +305,27 @@ fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
                         ),
                     }
                 }
+            }
+        }
+        // This one *does* need a live Trove: it reconciles and, if anything
+        // was backfilled, pushes the updated index.
+        LibraryCmd::BackfillSlugs => {
+            let mut trove = runtime::open_trove()?;
+            let report = trove
+                .backfill_slugs(cli.offline)
+                .context("backfilling library-relative-path slugs")?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{}/{} backfilled ({} already had a slug, {} outside the library root, \
+                     {} with no recorded source path)",
+                    report.backfilled,
+                    report.total,
+                    report.already_had_slug,
+                    report.outside_root,
+                    report.no_source_path,
+                );
             }
         }
     }

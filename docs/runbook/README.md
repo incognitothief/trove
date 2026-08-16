@@ -21,6 +21,7 @@ backends, and how to invoke the CLI.
 | [Playlist](04-playlist.md) | `trove playlist …` | Build logical crates; export portable playlist files |
 | [Volume](05-volume.md) | `trove volume …` | Prepare and inspect performance USB/SSD drives |
 | [Sync](06-sync.md) | `trove sync …` | Flash tracks and playlists to a mounted volume |
+| [Library](07-library.md) | `trove library …` | Declare the library root; backfill cross-drive identity for existing content |
 
 ## End-to-end operator flows
 

@@ -440,6 +440,56 @@ mod tests {
     }
 
     #[test]
+    fn backfill_slugs_gives_already_archived_content_a_slug_without_touching_bytes() {
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Theo Parrish")).unwrap();
+        std::fs::write(
+            library.path().join("Theo Parrish/Track.mp3"),
+            b"audio-bytes",
+        )
+        .unwrap();
+
+        // Import *without* a declared root first — simulates content
+        // archived before this feature existed, exactly the real-world case
+        // this unit is for.
+        let home = tempfile::tempdir().unwrap();
+        let mut trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+        let mut progress = NoopImportProgress;
+        let (_, committed) = trove
+            .import_run_full(library.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+        assert_eq!(committed, 1);
+        let before = trove.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(before[0].library_relative_path, None);
+
+        // No root declared yet: backfill refuses rather than guessing one.
+        assert!(trove.backfill_slugs(false).is_err());
+
+        // Declare the root retroactively, then backfill.
+        trove.set_library_root(library.path()).unwrap();
+        let report = trove.backfill_slugs(false).unwrap();
+        assert_eq!(report.total, 1);
+        assert_eq!(report.backfilled, 1);
+        assert_eq!(report.already_had_slug, 0);
+
+        let after = trove.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(
+            after[0].library_relative_path.as_deref(),
+            Some("Theo Parrish/Track.mp3")
+        );
+        // Content identity is untouched -- same sha256, same object key.
+        assert_eq!(after[0].sha256, before[0].sha256);
+        assert_eq!(after[0].object_key, before[0].object_key);
+
+        // Running it again is a clean no-op (nothing left to backfill).
+        let second_report = trove.backfill_slugs(false).unwrap();
+        assert_eq!(second_report.backfilled, 0);
+        assert_eq!(second_report.already_had_slug, 1);
+    }
+
+    #[test]
     fn import_skips_archive_duplicate_sha() {
         let dir1 = tempfile::tempdir().unwrap();
         std::fs::write(dir1.path().join("first.mp3"), b"same-bytes").unwrap();

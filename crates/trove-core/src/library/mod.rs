@@ -4,6 +4,8 @@
 //! `import`, which is scoped to a single job's own source path, not the
 //! stable, explicitly-declared root these features need instead.
 
+pub mod backfill;
 pub mod slug;
 
+pub use backfill::{plan_slug_backfill, BackfillSlugsReport};
 pub use slug::compute_slug;
