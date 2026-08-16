@@ -41,15 +41,15 @@ notes). **Closed** items are listed for context only — remove from mental back
 | UI vs genesis workflows | **Partially open** | See [UI](#ui-vs-genesis-workflows). |
 | `playlists.jsonl` in bucket | **Open** | Path constant only; playlists live in local `playlists.sqlite`, not pushed with index. |
 | Shared client wiring duplicated | **Open** | `runtime::open_trove` pattern copied CLI ↔ `trove-serverd`. |
-| Tauri desktop shell | **Out of scope** | Intentionally deferred; React + `trove-serverd` is the UI path. |
+| Tauri desktop shell | **Decided** | [ADR 007](007-tauri-shell-and-io-durability.md): adopted as the desktop shell; `trove-serverd` retired from the primary path (parked, not deleted). |
 
 ### Suggested priority (revised)
 
 1. **Archive backfill** — run durable import at scale (resume already shipped).
 2. **Tag extraction / index metadata** — after backfill; unlocks query + USB folder layout.
-3. **CAS on `schema-version.json`** — before multi-machine or parallel import/backfill jobs.
-4. **`archive verify` + stronger object checksum checks** — trust but verify at archive level.
-5. **`sync query --to` + flash UI/daemon routes** — complete query → USB loop in UI.
+3. **CAS on `schema-version.json`** — before multi-machine or parallel import/backfill jobs. Scoped as immediate work under [ADR 007](007-tauri-shell-and-io-durability.md); not yet implemented.
+4. **`archive verify` + stronger object checksum checks** — trust but verify at archive level. Also scoped under [ADR 007](007-tauri-shell-and-io-durability.md); not yet implemented.
+5. **`sync query --to` + flash UI/daemon routes** — complete query → USB loop in UI. Per [ADR 007](007-tauri-shell-and-io-durability.md), the UI half now targets the Tauri shell directly, not new `trove-serverd` routes.
 6. **Bucket portable index** — write/pull `archive-index.sqlite`; push `playlists.jsonl` if genesis still wants it.
 7. **Analyzers** (names / art / BPM) — ADR 002.
 8. **Streaming multipart + disk-backed upload** — huge-library polish.
@@ -108,7 +108,8 @@ notes). **Closed** items are listed for context only — remove from mental back
 | **`trove archive verify`** | CLI bails (“not implemented in this bootstrap yet”). Need checksum-level pass: every indexed `sha256` exists in bucket, optional byte re-read vs hash, report orphans/drift. |
 | **`archive-index.sqlite` not written** | Genesis (ADR 000) keeps JSONL + SQLite in bucket for fast restore. `push_index` / `reconcile` use JSONL only; `ARCHIVE_INDEX_SQLITE` path is unused. |
 | **`playlists.jsonl` not pushed** | Playlists are host-local (`playlists.sqlite`). Bucket key constant exists; no push/pull with index generation. |
-| Compare-and-swap on `schema-version.json` | Also tracked under tag section — concurrent `push_index` can clobber (ADR 001 follow-up). |
+| Compare-and-swap on `schema-version.json` | Also tracked under tag section — concurrent `push_index` can clobber (ADR 001 follow-up). Scoped as immediate work under [ADR 007](007-tauri-shell-and-io-durability.md) (Group B1); not yet implemented. |
+| **Cold-cache dedupe can create duplicate archive rows** | `import_plan`/`import_run_full` never reconcile first (`facade.rs:360-380`, `516-527`), so the archive-wide dedupe check (`import/mod.rs:242-247`, `662-670`) only sees what the local cache already has. A cold cache (new machine, wiped `~/.trove`, or simply stale) can mint a second `ArchiveEntry`/`TrackId` for content the bucket already holds, even though `store.exists` correctly prevents a duplicate byte write. Scoped under [ADR 007](007-tauri-shell-and-io-durability.md) (Group C2, "reconcile-before-import"); not yet implemented. |
 
 ---
 
@@ -129,7 +130,7 @@ notes). **Closed** items are listed for context only — remove from mental back
 | Gap | Notes |
 | --- | ----- |
 | Duplicated Trove wiring | `runtime::open_trove` + config loading duplicated in `trove-cli` and `trove-serverd` (ADR 001 acknowledged). Small shared crate or module would reduce drift. |
-| Tauri desktop shell | Intentionally out of scope; web UI + local daemon is the genesis UI path. |
+| Tauri desktop shell | **Closed** — [ADR 007](007-tauri-shell-and-io-durability.md): UI calls `trove-core` directly via Tauri commands; `trove-serverd` parked (kept compiling/tested, no new routes). |
 
 ---
 
@@ -175,7 +176,11 @@ Objects in S3 **do not change** if `sha256` is unchanged. `track_id` stays stabl
 
 - **`trove query --artist` / `--album`** — unreliable; don’t depend on them for migration QA.
 - **USB folder names** — may not match tags; Mixxx display can still be correct.
-- **Archive safety** — unaffected; dedupe and resume work on content hash.
+- **Archive safety** — dedupe and resume work on content hash *when the local
+  cache is warm*; a cold cache can miss and create a duplicate row (see the
+  cold-cache dedupe gap under [Archive integrity](#archive-integrity-and-bucket-index-form)
+  above — this line previously overclaimed "unaffected" without that
+  qualifier).
 
 ### Related gaps (same phase)
 
@@ -200,6 +205,8 @@ Objects in S3 **do not change** if `sha256` is unchanged. `track_id` stays stabl
 
 | Date | Change |
 | --- | --- |
+| 2026-08-16 | [ADR 007](007-tauri-shell-and-io-durability.md) expanded significantly beyond its original Tauri/CAS/verify scope: now also covers a cold-cache duplicate-archive-entry gap (dedupe was never as "archive-wide" as claimed — see the entry below), a persistent stat cache for repeat scans, cross-drive content identity via an explicit library-root + relative-path slug, a durable bucket-pushed Backfill Plan with a CAS-free event log for multi-machine coordination, and retirement of `scripts/import-batch.sh` in favor of first-class core commands. See ADR 007 directly — this file no longer tracks that detail, per its own "prefer a pointer" convention. |
+| 2026-08-16 | [ADR 007](007-tauri-shell-and-io-durability.md): Tauri desktop shell + `trove-serverd` retirement decided (both rows closed). CAS on `schema-version.json` and stronger archive/import verify pulled into ADR 007's immediate scope — no longer just backlog rows below. |
 | 2026-07-08 | Created ADR 999. Added playlist `show` gap and runbooks-for-all-command-sets note. Seeded from ADR 001–006 and recent implementation work. |
 | 2026-07-08 | Added tag extraction / metadata backfill section: defer until after archive backfill; index enrichment via upsert + push_index without re-upload. |
 | 2026-07-08 | Reconciled early genesis gap analysis: closed import/sync/export items; added archive verify, bucket index form, UI workflow table, packaging gaps, revised priority. |
