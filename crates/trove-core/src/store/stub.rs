@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 
-use super::{ObjectMeta, ObjectStore};
+use super::{ObjectMeta, ObjectStore, PutOutcome};
 use crate::error::{Error, Result};
 
 /// A trivial, process-local object store backed by a `HashMap`.
@@ -85,5 +85,32 @@ impl ObjectStore for StubStore {
             .collect();
         keys.sort();
         Ok(keys)
+    }
+
+    /// Genuinely atomic: the check and the write happen under one lock
+    /// acquisition, unlike `FsStore`'s local simulation. This makes
+    /// `StubStore` suitable for real multi-threaded concurrency tests, not
+    /// just control-flow tests.
+    fn put_if_match(
+        &self,
+        key: &str,
+        expected_etag: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<PutOutcome> {
+        let mut objects = self.objects.lock().expect("store lock poisoned");
+        let current_etag = objects.get(key).map(|b| Self::etag(b));
+        let matches = match expected_etag {
+            None => current_etag.is_none(),
+            Some(expected) => current_etag.as_deref() == Some(expected),
+        };
+        if !matches {
+            return Ok(PutOutcome::Conflict { current_etag });
+        }
+        objects.insert(key.to_string(), bytes.to_vec());
+        Ok(PutOutcome::Written(ObjectMeta {
+            key: key.to_string(),
+            size_bytes: bytes.len() as u64,
+            etag: Some(Self::etag(bytes)),
+        }))
     }
 }

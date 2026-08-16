@@ -89,7 +89,9 @@ mod tests {
         let paths = BucketPaths::new(".trove", "music");
         let store = StubStore::new();
         let jsonl = index::entries_to_jsonl(entries).unwrap();
-        store.put(&paths.archive_index_jsonl(), &jsonl).unwrap();
+        store
+            .put(&paths.archive_index_generation(generation), &jsonl)
+            .unwrap();
         let marker = SchemaVersion {
             schema_version: crate::archive::CURRENT_SCHEMA_VERSION,
             generation,
@@ -333,29 +335,6 @@ mod tests {
     fn import_durable_resume_skips_uploaded_files() {
         use std::sync::{Arc, Mutex};
 
-        struct SharedStub(Arc<Mutex<StubStore>>);
-
-        impl ObjectStore for SharedStub {
-            fn get(&self, key: &str) -> Result<Vec<u8>> {
-                self.0.lock().unwrap().get(key)
-            }
-            fn put(&self, key: &str, bytes: &[u8]) -> Result<crate::store::ObjectMeta> {
-                self.0.lock().unwrap().put(key, bytes)
-            }
-            fn exists(&self, key: &str) -> Result<bool> {
-                self.0.lock().unwrap().exists(key)
-            }
-            fn head(&self, key: &str) -> Result<Option<crate::store::ObjectMeta>> {
-                self.0.lock().unwrap().head(key)
-            }
-            fn copy(&self, from: &str, to: &str) -> Result<crate::store::ObjectMeta> {
-                self.0.lock().unwrap().copy(from, to)
-            }
-            fn list(&self, prefix: &str) -> Result<Vec<String>> {
-                self.0.lock().unwrap().list(prefix)
-            }
-        }
-
         struct FailAlwaysOnB {
             inner: Arc<Mutex<StubStore>>,
         }
@@ -381,6 +360,17 @@ mod tests {
             }
             fn list(&self, prefix: &str) -> Result<Vec<String>> {
                 self.inner.lock().unwrap().list(prefix)
+            }
+            fn put_if_match(
+                &self,
+                key: &str,
+                expected_etag: Option<&str>,
+                bytes: &[u8],
+            ) -> Result<crate::store::PutOutcome> {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .put_if_match(key, expected_etag, bytes)
             }
         }
 
@@ -527,5 +517,157 @@ mod tests {
         db.prune_job(id).unwrap();
         assert!(db.load_job(id).is_err());
         assert!(db.list_jobs(true).unwrap().is_empty());
+    }
+
+    /// Test-only `ObjectStore` sharing one `StubStore` across multiple
+    /// independent `Trove` instances (simulating separate machines pointed at
+    /// the same bucket). `StubStore`'s internal mutex makes this genuinely
+    /// atomic, unlike `FsStore` — see ADR 007, Group B1, on why that
+    /// distinction matters for what these tests can actually prove.
+    struct SharedStub(std::sync::Arc<std::sync::Mutex<StubStore>>);
+
+    impl ObjectStore for SharedStub {
+        fn get(&self, key: &str) -> Result<Vec<u8>> {
+            self.0.lock().unwrap().get(key)
+        }
+        fn put(&self, key: &str, bytes: &[u8]) -> Result<crate::store::ObjectMeta> {
+            self.0.lock().unwrap().put(key, bytes)
+        }
+        fn exists(&self, key: &str) -> Result<bool> {
+            self.0.lock().unwrap().exists(key)
+        }
+        fn head(&self, key: &str) -> Result<Option<crate::store::ObjectMeta>> {
+            self.0.lock().unwrap().head(key)
+        }
+        fn copy(&self, from: &str, to: &str) -> Result<crate::store::ObjectMeta> {
+            self.0.lock().unwrap().copy(from, to)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.0.lock().unwrap().list(prefix)
+        }
+        fn put_if_match(
+            &self,
+            key: &str,
+            expected_etag: Option<&str>,
+            bytes: &[u8],
+        ) -> Result<crate::store::PutOutcome> {
+            self.0.lock().unwrap().put_if_match(key, expected_etag, bytes)
+        }
+    }
+
+    #[test]
+    fn push_index_merges_entries_committed_by_another_writer() {
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(StubStore::new()));
+        let config = test_config();
+        let mut progress = NoopImportProgress;
+
+        // "Machine A": a fresh local cache, imports one track and pushes.
+        let dir_a = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("a.mp3"), b"audio-a").unwrap();
+        let home_a = tempfile::tempdir().unwrap();
+        let mut trove_a = Trove::open_with_store(
+            config.clone(),
+            home_a.path(),
+            Box::new(SharedStub(shared.clone())),
+        )
+        .unwrap();
+        let mut job_a = trove_a
+            .import_plan(dir_a.path(), &ImportOptions::default(), &mut progress)
+            .unwrap();
+        assert_eq!(trove_a.import_run(&mut job_a, &mut progress).unwrap(), 1);
+
+        // "Machine B": a *completely separate* local cache that has never
+        // reconciled and knows nothing about machine A's push. Imports a
+        // different track and pushes — this is the exact scenario the review
+        // caught: does B's push silently drop A's already-canonical entry?
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_b.path().join("b.mp3"), b"audio-b").unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        let mut trove_b = Trove::open_with_store(
+            config.clone(),
+            home_b.path(),
+            Box::new(SharedStub(shared.clone())),
+        )
+        .unwrap();
+        let mut job_b = trove_b
+            .import_plan(dir_b.path(), &ImportOptions::default(), &mut progress)
+            .unwrap();
+        assert_eq!(trove_b.import_run(&mut job_b, &mut progress).unwrap(), 1);
+
+        // A third, fresh machine reconciling from scratch must see both
+        // tracks. Before the fix, B's push would have written its own
+        // `archive.all()` (missing A's entry) straight to the fixed
+        // `archive-index.jsonl` key, silently overwriting A's contribution.
+        let home_c = tempfile::tempdir().unwrap();
+        let mut trove_c =
+            Trove::open_with_store(config, home_c.path(), Box::new(SharedStub(shared))).unwrap();
+        let results = trove_c.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "machine B's push must not drop machine A's already-committed entry"
+        );
+    }
+
+    #[test]
+    fn push_index_no_lost_update_under_real_concurrent_pushes() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        const WRITERS: usize = 6;
+
+        let shared = Arc::new(Mutex::new(StubStore::new()));
+        let config = test_config();
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let shared = shared.clone();
+                let config = config.clone();
+                thread::spawn(move || {
+                    let dir = tempfile::tempdir().unwrap();
+                    std::fs::write(
+                        dir.path().join(format!("track-{i}.mp3")),
+                        format!("audio-{i}").as_bytes(),
+                    )
+                    .unwrap();
+                    let home = tempfile::tempdir().unwrap();
+                    let mut trove = Trove::open_with_store(
+                        config,
+                        home.path(),
+                        Box::new(SharedStub(shared)),
+                    )
+                    .unwrap();
+                    let mut progress = NoopImportProgress;
+                    let mut job = trove
+                        .import_plan(dir.path(), &ImportOptions::default(), &mut progress)
+                        .unwrap();
+                    trove.import_run(&mut job, &mut progress)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            assert_eq!(
+                h.join().unwrap().unwrap(),
+                1,
+                "every concurrent writer's commit must eventually succeed under contention, \
+                 never be silently lost or hard-fail"
+            );
+        }
+
+        let home_check = tempfile::tempdir().unwrap();
+        let mut checker =
+            Trove::open_with_store(config, home_check.path(), Box::new(SharedStub(shared)))
+                .unwrap();
+        let results = checker.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(
+            results.len(),
+            WRITERS,
+            "no writer's commit should be lost under real concurrent pushes \
+             (found {} of {WRITERS} expected tracks)",
+            results.len()
+        );
     }
 }

@@ -6,8 +6,6 @@
 use crate::error::Result;
 use crate::model::{ArchiveEntry, ArtworkRecord, SchemaVersion};
 
-/// Object key (relative to the bucket prefix) of the JSONL index.
-pub const ARCHIVE_INDEX_JSONL: &str = "archive-index.jsonl";
 /// Object key of the SQLite index (fast restore).
 pub const ARCHIVE_INDEX_SQLITE: &str = "archive-index.sqlite";
 /// Object key of the reconcile generation marker.
@@ -36,8 +34,14 @@ impl BucketPaths {
         format!("{}/{}", self.prefix, name)
     }
 
-    pub fn archive_index_jsonl(&self) -> String {
-        self.join(ARCHIVE_INDEX_JSONL)
+    /// Object key of the immutable, generation-keyed canonical index
+    /// (`archive-index/<generation>.jsonl`). Never overwritten once written —
+    /// `schema-version.json` is the only mutable pointer, CAS-protected
+    /// separately (ADR 007, Group B1). Derived from the generation number
+    /// already carried by [`crate::model::SchemaVersion`]; no separate field
+    /// needed to know which object is canonical.
+    pub fn archive_index_generation(&self, generation: u64) -> String {
+        self.join(&format!("archive-index/{generation}.jsonl"))
     }
     pub fn archive_index_sqlite(&self) -> String {
         self.join(ARCHIVE_INDEX_SQLITE)

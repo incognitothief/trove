@@ -25,6 +25,20 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
 }
 
+/// Outcome of a conditional write (see [`ObjectStore::put_if_match`]).
+#[derive(Debug, Clone)]
+pub enum PutOutcome {
+    /// The write succeeded.
+    Written(ObjectMeta),
+    /// The write was rejected because the object's current state didn't match
+    /// `expected_etag` (or, for a create-only write, because the object
+    /// already existed). `current_etag` is a best-effort snapshot for
+    /// diagnostics only — callers that need to retry must re-read current
+    /// state themselves rather than trust this value, since it can itself be
+    /// stale by the time a retry runs (ADR 007, Group B1).
+    Conflict { current_etag: Option<String> },
+}
+
 /// A durable object store (S3 or S3-compatible).
 ///
 /// Kept intentionally small for the bootstrap; multipart/resume specifics will
@@ -47,4 +61,21 @@ pub trait ObjectStore: Send + Sync {
 
     /// List object keys under a prefix.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// Write `bytes` to `key` only if the object's current etag matches
+    /// `expected_etag`. `expected_etag: None` means create-only: the write
+    /// succeeds only if no object currently exists at `key`.
+    ///
+    /// This is the compare-and-swap primitive backing the canonical index
+    /// (ADR 007, Group B1) — never used for ordinary content-addressed audio
+    /// objects, only for the small `schema-version.json` marker and the
+    /// generation-keyed `archive-index/<generation>.jsonl` payload it points
+    /// to. Implementations are not required to support conditional writes for
+    /// arbitrarily large payloads; see each implementation's doc comment.
+    fn put_if_match(
+        &self,
+        key: &str,
+        expected_etag: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<PutOutcome>;
 }

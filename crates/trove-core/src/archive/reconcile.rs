@@ -66,9 +66,12 @@ pub fn reconcile(
     }
 
     // Generations differ (or the cache is empty/cold): pull the JSONL index and
-    // rebuild the local cache, then stamp it with the bucket generation.
+    // rebuild the local cache, then stamp it with the bucket generation. The
+    // index object to fetch is derived from the marker's generation, not a
+    // fixed key — the marker is authoritative about which immutable index
+    // object is canonical (ADR 007, Group B1).
     let jsonl = store
-        .get(&paths.archive_index_jsonl())
+        .get(&paths.archive_index_generation(remote_marker.generation))
         .map_err(|e| Error::Reconcile(format!("could not pull archive index: {e}")))?;
     let entries = index::entries_from_jsonl(&jsonl)?;
     local.replace_all(entries.iter())?;

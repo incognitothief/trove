@@ -24,7 +24,7 @@ use crate::model::SchemaVersion;
 use crate::model::{ArchiveEntry, ArtworkRecord, Playlist, TrackId};
 use crate::playlist::PlaylistDb;
 use crate::query::QuerySpec;
-use crate::store::{stub::StubStore, ObjectStore};
+use crate::store::{stub::StubStore, ObjectStore, PutOutcome};
 use crate::sync::{self, PlaylistExport, SyncPlan, VolumeDiffEntry};
 use crate::volume;
 
@@ -598,31 +598,117 @@ impl Trove {
     }
 
     /// Push the local archive index up to the bucket as the new canonical
-    /// generation (writes `archive-index.jsonl` + `schema-version.json`).
+    /// generation.
+    ///
+    /// Writes an immutable, generation-keyed index object
+    /// (`archive-index/<generation>.jsonl`, create-only) and only then
+    /// CAS-advances the `schema-version.json` marker to point at it. Both
+    /// writes are conditional, so two machines racing to push never produce a
+    /// state where one machine's marker points at (or is decoupled from) the
+    /// other's index content — see ADR 007, Group B1, for the exact failure
+    /// mode this closes relative to a naive "CAS the marker only" design.
+    ///
+    /// Retries from a fresh read on either conflict (someone else claimed the
+    /// generation number, or advanced the marker between our read and our
+    /// write) up to a small retry cap — a push under real contention makes
+    /// progress because every retry sees the winner's already-durable write,
+    /// never the same stale state twice.
     pub fn push_index(&mut self) -> Result<u64> {
-        let entries = self.archive.all()?;
-        let jsonl = index::entries_to_jsonl(&entries)?;
-        self.store.put(&self.paths.archive_index_jsonl(), &jsonl)?;
+        const MAX_RETRIES: u32 = 10;
 
-        let next_generation = self.remote_generation()?.unwrap_or(0) + 1;
-        let marker = SchemaVersion {
-            schema_version: CURRENT_SCHEMA_VERSION,
-            generation: next_generation,
-            updated_at: Utc::now(),
-        };
-        self.store.put(
-            &self.paths.schema_version(),
-            &index::schema_version_bytes(&marker)?,
-        )?;
-        self.archive.set_generation(next_generation)?;
-        Ok(next_generation)
+        for _attempt in 0..MAX_RETRIES {
+            let (remote_generation, marker_etag) = self.head_marker()?;
+
+            // If the bucket is ahead of what this local cache last knew about
+            // — because this is a retry after losing a race, or simply
+            // because another machine pushed since we last reconciled — merge
+            // that newer content in *additively* before computing what to
+            // push. A destructive reconcile (`replace_all`, which does
+            // `DELETE FROM tracks` then reinserts) would silently drop any
+            // entries this instance has committed locally but not yet pushed
+            // itself; upsert-only picks up the other writer's entries without
+            // losing ours. This is what actually prevents a lost update on
+            // retry — CAS alone only stops two writers from silently sharing
+            // one generation's key, it does not by itself keep a retrying
+            // writer's stale local view from omitting what it lost the race
+            // on (see ADR 007, Group B1).
+            if let Some(remote_gen) = remote_generation {
+                if self.archive.generation()? != Some(remote_gen) {
+                    self.merge_remote_generation(remote_gen)?;
+                }
+            }
+
+            let next_generation = remote_generation.unwrap_or(0) + 1;
+            let entries = self.archive.all()?;
+            let jsonl = index::entries_to_jsonl(&entries)?;
+            let index_key = self.paths.archive_index_generation(next_generation);
+
+            // Step 1: claim this generation's index object. Create-only —
+            // the key has never been used before, so a conflict here means
+            // another writer already claimed `next_generation`.
+            match self.store.put_if_match(&index_key, None, &jsonl)? {
+                PutOutcome::Written(_) => {}
+                PutOutcome::Conflict { .. } => continue,
+            }
+
+            // Step 2: only now advance the marker to point at the index we
+            // just durably wrote. If this loses the race (someone else's
+            // marker write landed between our read and this write), our
+            // already-written index object at `index_key` is simply
+            // orphaned — harmless, since readers only trust the marker.
+            let marker = SchemaVersion {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                generation: next_generation,
+                updated_at: Utc::now(),
+            };
+            match self.store.put_if_match(
+                &self.paths.schema_version(),
+                marker_etag.as_deref(),
+                &index::schema_version_bytes(&marker)?,
+            )? {
+                PutOutcome::Written(_) => {
+                    self.archive.set_generation(next_generation)?;
+                    return Ok(next_generation);
+                }
+                PutOutcome::Conflict { .. } => continue,
+            }
+        }
+
+        Err(crate::error::Error::store(format!(
+            "push_index: exceeded {MAX_RETRIES} retries under contention"
+        )))
     }
 
-    fn remote_generation(&self) -> Result<Option<u64>> {
-        match self.store.get(&self.paths.schema_version()) {
-            Ok(bytes) => Ok(Some(index::schema_version_from_bytes(&bytes)?.generation)),
-            Err(crate::error::Error::NotFound(_)) => Ok(None),
-            Err(e) => Err(e),
+    /// Current remote generation (if the marker exists yet) and its etag, as
+    /// the compare-and-swap baseline for `push_index`. `head()` alone gives
+    /// the etag but not the parsed generation number, so a small `get()`
+    /// follows when the marker exists — the marker is a few dozen bytes of
+    /// JSON, so this costs nothing meaningful, and any drift between the two
+    /// calls is harmless: the final `put_if_match` uses the etag captured
+    /// here, so any real change is still caught there regardless.
+    fn head_marker(&self) -> Result<(Option<u64>, Option<String>)> {
+        let marker_key = self.paths.schema_version();
+        match self.store.head(&marker_key)? {
+            Some(meta) => {
+                let bytes = self.store.get(&marker_key)?;
+                let marker = index::schema_version_from_bytes(&bytes)?;
+                Ok((Some(marker.generation), meta.etag))
+            }
+            None => Ok((None, None)),
         }
+    }
+
+    /// Pull the given generation's index and upsert its entries into the
+    /// local cache — additive, never deletes. Used by `push_index` to absorb
+    /// another writer's already-committed entries before retrying, without
+    /// destroying this instance's own not-yet-pushed local entries the way a
+    /// full `reconcile()` (which deletes and replaces) would.
+    fn merge_remote_generation(&mut self, generation: u64) -> Result<()> {
+        let jsonl = self.store.get(&self.paths.archive_index_generation(generation))?;
+        let entries = index::entries_from_jsonl(&jsonl)?;
+        for entry in &entries {
+            self.archive.upsert(entry)?;
+        }
+        Ok(())
     }
 }

@@ -20,11 +20,12 @@ use std::future::Future;
 
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
 
-use super::{ObjectMeta, ObjectStore};
+use super::{ObjectMeta, ObjectStore, PutOutcome};
 use crate::error::{Error, Result};
 
 /// Objects at or below this size use a single `PutObject`; larger buffers are
@@ -44,6 +45,15 @@ impl S3Store {
     /// Connect to `bucket` in `region`, optionally against a custom `endpoint`
     /// (for S3-compatible stores like MinIO or Cloudflare R2). Credentials are
     /// resolved from the default AWS provider chain (env, profile, IMDS, …).
+    ///
+    /// When a custom `endpoint` is given, this also verifies the endpoint
+    /// actually honors conditional writes before returning (ADR 007, Group
+    /// B1): AWS S3 itself only gained native `If-Match`/`If-None-Match`
+    /// support on `PutObject` in 2024, and S3-compatible services vary by
+    /// product and version. If the endpoint silently ignores the conditional
+    /// header instead of honoring or rejecting it, `put_if_match` would look
+    /// like it works while providing no protection at all — the worst
+    /// possible failure mode. Real AWS is trusted without a probe.
     pub fn new(
         bucket: impl Into<String>,
         region: impl Into<String>,
@@ -51,6 +61,7 @@ impl S3Store {
     ) -> Result<Self> {
         let bucket = bucket.into();
         let region = region.into();
+        let has_custom_endpoint = endpoint.is_some();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -60,11 +71,65 @@ impl S3Store {
         // the owned runtime via the same spawn-and-block bridge so this is safe
         // even when called from inside a client's tokio runtime.
         let client = block_on_runtime(&runtime, build_client(region, endpoint));
-        Ok(S3Store {
+        let store = S3Store {
             client,
             bucket,
             runtime,
-        })
+        };
+        if has_custom_endpoint {
+            store.verify_conditional_write_support()?;
+        }
+        Ok(store)
+    }
+
+    /// Probe: create-only write a throwaway object, then attempt the same
+    /// create-only write again. A conditional-write-honoring endpoint must
+    /// reject the second attempt (the object now exists); an endpoint that
+    /// silently ignores `If-None-Match` will let it through. Fails loud
+    /// rather than letting CAS silently provide no protection — consistent
+    /// with this project's convention of surfacing gaps explicitly rather
+    /// than faking success (`AGENTS.md`).
+    ///
+    /// This has not been verified against a live MinIO/R2/etc. deployment;
+    /// the logic is correct against documented S3 conditional-write
+    /// semantics, but real-world endpoint behavior should be confirmed
+    /// before relying on this in production (see ADR 007's validation plan).
+    fn verify_conditional_write_support(&self) -> Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let probe_key = format!(".trove-cas-probe/{}-{nonce}", std::process::id());
+        let first = self.put_if_match(&probe_key, None, b"trove-cas-probe")?;
+        if matches!(first, PutOutcome::Conflict { .. }) {
+            return Err(Error::store(
+                "conditional-write capability probe: unexpected conflict on first (create-only) write",
+            ));
+        }
+        let second = self.put_if_match(&probe_key, None, b"trove-cas-probe-2");
+        self.best_effort_delete(&probe_key);
+        match second? {
+            PutOutcome::Conflict { .. } => Ok(()),
+            PutOutcome::Written(_) => Err(Error::store(
+                "configured endpoint does not appear to honor conditional writes \
+                 (a second create-only write to the same key was not rejected) — \
+                 refusing to rely on compare-and-swap against this endpoint; see \
+                 ADR 007, Group B1",
+            )),
+        }
+    }
+
+    /// Best-effort cleanup for the capability probe; failures are ignored
+    /// since this is diagnostic housekeeping, not part of the store's
+    /// correctness contract.
+    fn best_effort_delete(&self, key: &str) {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key = key.to_string();
+        let _: std::result::Result<(), ()> = self.block_on(async move {
+            let _ = client.delete_object().bucket(&bucket).key(&key).send().await;
+            Ok(())
+        });
     }
 
     /// Bridge an async operation to the synchronous trait: spawn onto the owned
@@ -224,6 +289,64 @@ impl ObjectStore for S3Store {
             }
             keys.sort();
             Ok(keys)
+        })
+    }
+
+    /// Uses S3's native conditional-write headers (`If-Match` for
+    /// update-only, `If-None-Match: *` for create-only) — genuinely atomic
+    /// server-side, no client-side locking. Only supports the single-`PutObject`
+    /// path: `put_if_match` is scoped to the small `schema-version.json`
+    /// marker and generation-keyed index payloads (ADR 007, Group B1), never
+    /// to audio objects, so multipart conditional writes are deliberately not
+    /// implemented — an oversized payload fails loudly rather than silently
+    /// dropping the conditional check.
+    fn put_if_match(
+        &self,
+        key: &str,
+        expected_etag: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<PutOutcome> {
+        if bytes.len() > MULTIPART_THRESHOLD {
+            return Err(Error::store(format!(
+                "put_if_match {key}: conditional multipart writes are not supported ({} bytes > {MULTIPART_THRESHOLD})",
+                bytes.len()
+            )));
+        }
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let key_owned = key.to_string();
+        let data = bytes.to_vec();
+        let size_bytes = data.len() as u64;
+        let expected = expected_etag.map(|s| s.to_string());
+        self.block_on(async move {
+            let mut req = client
+                .put_object()
+                .bucket(&bucket)
+                .key(&key_owned)
+                .body(ByteStream::from(data));
+            req = match &expected {
+                Some(etag) => req.if_match(etag),
+                None => req.if_none_match("*"),
+            };
+            match req.send().await {
+                Ok(resp) => Ok(PutOutcome::Written(ObjectMeta {
+                    key: key_owned,
+                    size_bytes,
+                    etag: resp.e_tag().map(strip_quotes),
+                })),
+                Err(err) => {
+                    if let Some(service) = err.as_service_error() {
+                        // S3 returns 412 PreconditionFailed for a failed
+                        // If-Match/If-None-Match; the SDK has no typed
+                        // variant for it yet (aws-sdk-s3 1.137), so it
+                        // surfaces via the generic error code string.
+                        if service.code() == Some("PreconditionFailed") {
+                            return Ok(PutOutcome::Conflict { current_etag: None });
+                        }
+                    }
+                    Err(Error::store(format!("put_if_match {key_owned}: {err}")))
+                }
+            }
         })
     }
 }
