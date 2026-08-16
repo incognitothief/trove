@@ -264,3 +264,57 @@ done here), is:
 Related: [Import runbook — batch](../runbook/02-import.md#batch-import-multiple-folders),
 [ADR 000 — bucket is source of truth](../adr/000-bootstrap.md),
 [ADR 999](../adr/999-known-gaps-and-follow-ups.md).
+
+---
+
+## Reconciliation pass (desktop, 2026-08-16)
+
+> **DISCLAIMER — MACHINE OF ORIGIN:** This section was written on the
+> **desktop computer**. The pull below used this machine's `~/.trove` and AWS
+> credentials. It does not rewrite earlier sections.
+
+- **Date recorded:** 2026-08-16
+- **When:** ~15:22–15:25 ET (desktop)
+- **Kind:** cloud reconcile of this desktop against the canonical bucket index
+- **Machine of origin:** desktop computer
+- **Commands:** `CARGO_FEATURES=s3 bin/trove archive pull-index` (first call
+  happened to include `--offline`; that flag still hits S3 when reachable)
+
+This desktop had no `archive.sqlite` / `sync.sqlite` (cache trashed 2026-07-09).
+Config was valid S3: `name = "trove-archive"`, `region = "us-east-1"`. No
+`push-index`, no import, no job commit.
+
+### Outcome
+
+| When (ET) | Call | Report |
+| --- | --- | --- |
+| 2026-08-16 ~15:22 | First (`--offline`, bucket reachable) | `Rehydrated { generation: 623, entries_loaded: 7640 }` |
+| 2026-08-16 ~15:23 | Second (`--json`) | `UpToDate { generation: 623 }` |
+
+Canonical **committed** archive on this desktop is now generation **623**,
+**7,640** tracks. That matches the laptop snapshot's committed counts. The
+laptop local DB was in sync with the last successful index push; those numbers
+are no longer speculative for the committed index.
+
+### Teebs — left in history, not resumed
+
+Do **not** delete the Teebs job from this note. It is **not** the next
+operator step. Do not `import resume` / `import commit` job
+`53769506-2355-4660-87df-9f1077ae549f`.
+
+That folder never advanced the canonical index (25 files were `verified` on
+the laptop, never `committed`). Healing it is a later **rebackfill** of
+`/Volumes/T72/music/library/Teebs` (dedupe should no-op anything already in
+the archive). Until then, treat generation 623 / 7,640 as the committed
+baseline and Teebs as a known hole.
+
+### Action item
+
+- **Rebackfill Teebs to heal the canonical store** — import
+  `/Volumes/T72/music/library/Teebs` in a later session; do not resume the old
+  job id. Deferred; not blocking other work.
+
+### Next action
+
+Initial committed backfill is the baseline. Product work can return to ADR 999
+follow-ups. Teebs rebackfill is queued, not in progress.

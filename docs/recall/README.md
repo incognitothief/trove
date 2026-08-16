@@ -29,4 +29,4 @@ was. It is not a status checklist and it is not architecture.
 
 | Note | Session |
 | --- | --- |
-| [2026-08-15-bootstrap-through-first-backfill.md](2026-08-15-bootstrap-through-first-backfill.md) | Same backfill episode, two machines: desktop failed local-sim import; laptop S3 batch (~Teebs uncommitted). Desktop cross-reference + `feature/scripting` merge; bucket not queried |
+| [2026-08-15-bootstrap-through-first-backfill.md](2026-08-15-bootstrap-through-first-backfill.md) | Same backfill episode: desktop failed local-sim import; laptop S3 batch; 2026-08-16 desktop reconcile = gen 623 / 7640 committed. Teebs left as deferred rebackfill, not resumed |
