@@ -174,6 +174,8 @@ struct ImportBody {
     /// Explicit cover-art image files or folders.
     #[serde(default)]
     artwork_paths: Vec<String>,
+    #[serde(default)]
+    offline: bool,
 }
 
 async fn import(
@@ -192,7 +194,12 @@ async fn import(
             .collect(),
     };
     if body.plan_only {
-        let job = trove.import_plan(std::path::Path::new(&body.path), &options, &mut noop)?;
+        let job = trove.import_plan(
+            std::path::Path::new(&body.path),
+            &options,
+            body.offline,
+            &mut noop,
+        )?;
         let stats = job.stats();
         return Ok(Json(json!({
             "job_id": job.id,
@@ -201,8 +208,12 @@ async fn import(
             "artwork_candidates": job.artwork.len(),
         })));
     }
-    let (job, committed) =
-        trove.import_run_full(std::path::Path::new(&body.path), &options, &mut noop)?;
+    let (job, committed) = trove.import_run_full(
+        std::path::Path::new(&body.path),
+        &options,
+        body.offline,
+        &mut noop,
+    )?;
     Ok(Json(json!({
         "job_id": job.id,
         "committed": committed,

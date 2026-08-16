@@ -295,10 +295,10 @@ mod tests {
         let mut trove = Trove::in_memory(test_config()).unwrap();
         let mut progress = NoopImportProgress;
         let mut job = trove
-            .import_plan(dir.path(), &ImportOptions::default(), &mut progress)
+            .import_plan(dir.path(), &ImportOptions::default(), false, &mut progress)
             .unwrap();
         let sha = job.files[0].sha256.clone();
-        let committed = trove.import_run(&mut job, &mut progress).unwrap();
+        let committed = trove.import_run(&mut job, false, &mut progress).unwrap();
         assert_eq!(committed, 1);
 
         let results = trove.query(&QuerySpec::new(), false).unwrap();
@@ -318,16 +318,16 @@ mod tests {
         let mut trove = Trove::in_memory(test_config()).unwrap();
         let mut progress = NoopImportProgress;
         let mut first = trove
-            .import_plan(dir1.path(), &ImportOptions::default(), &mut progress)
+            .import_plan(dir1.path(), &ImportOptions::default(), false, &mut progress)
             .unwrap();
-        assert_eq!(trove.import_run(&mut first, &mut progress).unwrap(), 1);
+        assert_eq!(trove.import_run(&mut first, false, &mut progress).unwrap(), 1);
 
         let mut second = trove
-            .import_plan(dir2.path(), &ImportOptions::default(), &mut progress)
+            .import_plan(dir2.path(), &ImportOptions::default(), false, &mut progress)
             .unwrap();
         assert_eq!(second.files.len(), 1);
         assert_eq!(second.files[0].state, FileState::Duplicate);
-        assert_eq!(trove.import_run(&mut second, &mut progress).unwrap(), 0);
+        assert_eq!(trove.import_run(&mut second, false, &mut progress).unwrap(), 0);
         assert_eq!(trove.query(&QuerySpec::new(), false).unwrap().len(), 1);
     }
 
@@ -392,7 +392,7 @@ mod tests {
 
         let mut progress = NoopImportProgress;
         let job = trove
-            .import_plan(dir.path(), &ImportOptions::default(), &mut progress)
+            .import_plan(dir.path(), &ImportOptions::default(), false, &mut progress)
             .unwrap();
         assert_eq!(job.files.len(), 2);
 
@@ -403,11 +403,15 @@ mod tests {
         let mut trove2 =
             Trove::open_with_store(config, home.path(), Box::new(SharedStub(shared))).unwrap();
         let mut progress2 = NoopImportProgress;
-        let resumed = trove2.import_resume(&job.id, &mut progress2).unwrap();
+        let resumed = trove2
+            .import_resume(&job.id, false, &mut progress2)
+            .unwrap();
         assert_eq!(resumed.files[0].state, FileState::Verified);
         assert_eq!(resumed.files[1].state, FileState::Verified);
 
-        let committed = trove2.import_commit_job(&job.id, &mut progress2).unwrap();
+        let committed = trove2
+            .import_commit_job(&job.id, false, &mut progress2)
+            .unwrap();
         assert_eq!(committed, 2);
         assert_eq!(trove2.import_status(&job.id).unwrap().stats.committed, 2);
     }
@@ -468,14 +472,14 @@ mod tests {
             .unwrap();
         }
 
-        let trove =
+        let mut trove =
             Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new())).unwrap();
         let mut progress = NoopImportProgress;
         let jobs = trove.import_list(false).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].phase, Phase::Fingerprint);
 
-        let job = trove.import_continue_plan(id, &mut progress).unwrap();
+        let job = trove.import_continue_plan(id, false, &mut progress).unwrap();
         assert_eq!(job.phase, Phase::Dedupe);
         assert_eq!(job.files.len(), 3);
         assert!(job
@@ -556,6 +560,76 @@ mod tests {
     }
 
     #[test]
+    fn import_plan_reconciles_first_and_recognizes_already_archived_content() {
+        use std::sync::{Arc, Mutex};
+
+        let shared = Arc::new(Mutex::new(StubStore::new()));
+        let config = test_config();
+        let mut progress = NoopImportProgress;
+
+        // "Machine A": imports and pushes a track.
+        let dir_a = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("original.mp3"), b"identical-bytes").unwrap();
+        let home_a = tempfile::tempdir().unwrap();
+        let mut trove_a = Trove::open_with_store(
+            config.clone(),
+            home_a.path(),
+            Box::new(SharedStub(shared.clone())),
+        )
+        .unwrap();
+        let mut job_a = trove_a
+            .import_plan(dir_a.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+        assert_eq!(trove_a.import_run(&mut job_a, false, &mut progress).unwrap(), 1);
+
+        // "Machine B": a brand-new local cache (never reconciled, never seen
+        // this bucket before — the exact cold-cache condition this unit
+        // exists to close) imports the *same bytes* from a different path.
+        // Before this fix, `import_plan`'s dedupe check would query B's
+        // empty local cache, miss, and mark the file `Hashed` instead of
+        // `Duplicate` — going on to mint a second `ArchiveEntry` for content
+        // already in the bucket, even though `store.exists` would correctly
+        // avoid re-uploading the actual bytes.
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_b.path().join("different_name.mp3"), b"identical-bytes").unwrap();
+        let home_b = tempfile::tempdir().unwrap();
+        let mut trove_b = Trove::open_with_store(
+            config.clone(),
+            home_b.path(),
+            Box::new(SharedStub(shared.clone())),
+        )
+        .unwrap();
+        let job_b = trove_b
+            .import_plan(dir_b.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+        assert_eq!(
+            job_b.files[0].state,
+            FileState::Duplicate,
+            "reconcile-before-plan should let B recognize A's already-archived \
+             content instead of treating it as new"
+        );
+
+        let mut job_b = job_b;
+        let committed = trove_b.import_run(&mut job_b, false, &mut progress).unwrap();
+        assert_eq!(
+            committed, 0,
+            "a recognized duplicate must not be committed as a second entry"
+        );
+
+        // A fresh, third machine must see exactly one archive entry for this
+        // content, not two.
+        let home_c = tempfile::tempdir().unwrap();
+        let mut trove_c =
+            Trove::open_with_store(config, home_c.path(), Box::new(SharedStub(shared))).unwrap();
+        let results = trove_c.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "cold-cache import of already-archived content must not create a duplicate entry"
+        );
+    }
+
+    #[test]
     fn push_index_merges_entries_committed_by_another_writer() {
         use std::sync::{Arc, Mutex};
 
@@ -574,9 +648,9 @@ mod tests {
         )
         .unwrap();
         let mut job_a = trove_a
-            .import_plan(dir_a.path(), &ImportOptions::default(), &mut progress)
+            .import_plan(dir_a.path(), &ImportOptions::default(), false, &mut progress)
             .unwrap();
-        assert_eq!(trove_a.import_run(&mut job_a, &mut progress).unwrap(), 1);
+        assert_eq!(trove_a.import_run(&mut job_a, false, &mut progress).unwrap(), 1);
 
         // "Machine B": a *completely separate* local cache that has never
         // reconciled and knows nothing about machine A's push. Imports a
@@ -592,9 +666,9 @@ mod tests {
         )
         .unwrap();
         let mut job_b = trove_b
-            .import_plan(dir_b.path(), &ImportOptions::default(), &mut progress)
+            .import_plan(dir_b.path(), &ImportOptions::default(), false, &mut progress)
             .unwrap();
-        assert_eq!(trove_b.import_run(&mut job_b, &mut progress).unwrap(), 1);
+        assert_eq!(trove_b.import_run(&mut job_b, false, &mut progress).unwrap(), 1);
 
         // A third, fresh machine reconciling from scratch must see both
         // tracks. Before the fix, B's push would have written its own
@@ -641,9 +715,9 @@ mod tests {
                     .unwrap();
                     let mut progress = NoopImportProgress;
                     let mut job = trove
-                        .import_plan(dir.path(), &ImportOptions::default(), &mut progress)
+                        .import_plan(dir.path(), &ImportOptions::default(), false, &mut progress)
                         .unwrap();
-                    trove.import_run(&mut job, &mut progress)
+                    trove.import_run(&mut job, false, &mut progress)
                 })
             })
             .collect();

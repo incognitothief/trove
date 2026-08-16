@@ -357,12 +357,22 @@ impl Trove {
 
     /// Plan a bulk import (scan + hash + dedupe + gather art), persist to
     /// `sync.sqlite`, and write a local manifest.
+    ///
+    /// Reconciles first (`allow_offline` controls the same offline-fallback
+    /// behavior as [`Trove::reconcile`]). Without this, the archive-wide
+    /// dedupe check inside `import::plan` only sees whatever this machine's
+    /// local cache happened to already contain — cold on a fresh machine, or
+    /// simply stale if another device committed matching content since this
+    /// one last pulled — and would silently mint a duplicate `ArchiveEntry`
+    /// for content the bucket already has (ADR 007, Group C2).
     pub fn import_plan(
-        &self,
+        &mut self,
         source_root: &Path,
         options: &ImportOptions,
+        allow_offline: bool,
         progress: &mut dyn ImportProgress,
     ) -> Result<ImportJob> {
+        self.reconcile(allow_offline)?;
         let job = import::plan(
             source_root,
             import::DEFAULT_AUDIO_EXTENSIONS,
@@ -380,11 +390,17 @@ impl Trove {
     }
 
     /// Continue fingerprinting for a job interrupted during plan.
+    ///
+    /// Reconciles first, for the same reason as [`Trove::import_plan`] —
+    /// newly discovered files in the resumed scan get the same archive-wide
+    /// dedupe protection as a fresh plan would.
     pub fn import_continue_plan(
-        &self,
+        &mut self,
         job_id: &str,
+        allow_offline: bool,
         progress: &mut dyn ImportProgress,
     ) -> Result<ImportJob> {
+        self.reconcile(allow_offline)?;
         let (job, options) = self.import_db.load_job(job_id)?;
         let job = import::plan(
             &job.source_root,
@@ -452,11 +468,21 @@ impl Trove {
     }
 
     /// Commit verified files, capture artwork, and push the canonical index.
+    ///
+    /// Reconciles first, same reason as [`Trove::import_plan`] but for the
+    /// commit-time dedupe check (`import::commit`'s own `find_by_sha256`
+    /// lookup) rather than the scan-time one — in the staged workflow
+    /// (`plan` → `run` → `commit`), real time can pass between planning and
+    /// committing, during which another machine may have pushed matching
+    /// content. Reconciling only at plan time would leave this check exposed
+    /// to exactly the same cold-cache gap C2 exists to close (ADR 007).
     pub fn import_commit_job(
         &mut self,
         job_id: &str,
+        allow_offline: bool,
         progress: &mut dyn ImportProgress,
     ) -> Result<usize> {
+        self.reconcile(allow_offline)?;
         let (mut job, options) = self.import_db.load_job(job_id)?;
         let committed = import::commit(
             &mut job,
@@ -484,11 +510,12 @@ impl Trove {
     pub fn import_resume(
         &mut self,
         job_id: &str,
+        allow_offline: bool,
         progress: &mut dyn ImportProgress,
     ) -> Result<ImportJob> {
         let (job, _) = self.import_db.load_job(job_id)?;
         if job.phase == Phase::Fingerprint {
-            self.import_continue_plan(job_id, progress)?;
+            self.import_continue_plan(job_id, allow_offline, progress)?;
         }
         self.import_run_job(job_id, progress)
     }
@@ -517,22 +544,29 @@ impl Trove {
         &mut self,
         source_root: &Path,
         options: &ImportOptions,
+        allow_offline: bool,
         progress: &mut dyn ImportProgress,
     ) -> Result<(ImportJob, usize)> {
-        let job = self.import_plan(source_root, options, progress)?;
+        let job = self.import_plan(source_root, options, allow_offline, progress)?;
         self.import_run_job(&job.id, progress)?;
-        let committed = self.import_commit_job(&job.id, progress)?;
+        let committed = self.import_commit_job(&job.id, allow_offline, progress)?;
         let (job, _) = self.import_db.load_job(&job.id)?;
         Ok((job, committed))
     }
 
     /// Run a planned import to completion: upload → verify → commit, capture any
     /// co-located cover art, then advance the canonical index (only after commit).
+    ///
+    /// Reconciles first, same reasoning as [`Trove::import_commit_job`] — this
+    /// method commits directly rather than going through it, so it needs its
+    /// own reconcile call to get the same protection.
     pub fn import_run(
         &mut self,
         job: &mut ImportJob,
+        allow_offline: bool,
         progress: &mut dyn ImportProgress,
     ) -> Result<usize> {
+        self.reconcile(allow_offline)?;
         let options = self.loaded_options(&job.id).unwrap_or_default();
         self.import_db.save_job(job, &options)?;
         import::prepare_for_resume(job);

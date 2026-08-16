@@ -270,7 +270,7 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
         let opts = merge_import_options(&trove, &args.options);
         let source = std::path::Path::new(path);
         let (job, committed) = trove
-            .import_run_full(source, &opts, progress)
+            .import_run_full(source, &opts, cli.offline, progress)
             .with_context(|| format!("importing {path}"))?;
         if cli.json {
             println!(
@@ -296,7 +296,7 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
             let opts = merge_import_options(&trove, options);
             let source = std::path::Path::new(path);
             let job = trove
-                .import_plan(source, &opts, progress)
+                .import_plan(source, &opts, cli.offline, progress)
                 .with_context(|| format!("planning import of {path}"))?;
             print_planned_job(&job, cli.json);
         }
@@ -314,7 +314,7 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
         }
         ImportCmd::Commit { job_id } => {
             let committed = trove
-                .import_commit_job(job_id, progress)
+                .import_commit_job(job_id, cli.offline, progress)
                 .with_context(|| format!("committing import job {job_id}"))?;
             if cli.json {
                 println!(
@@ -330,7 +330,7 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
         }
         ImportCmd::Resume { job_id } => {
             let job = trove
-                .import_resume(job_id, progress)
+                .import_resume(job_id, cli.offline, progress)
                 .with_context(|| format!("resuming import job {job_id}"))?;
             print_run_result(&job, cli.json);
             if !cli.json {

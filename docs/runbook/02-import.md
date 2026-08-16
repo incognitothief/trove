@@ -13,6 +13,15 @@ scan → fingerprint (SHA-256) → dedupe → upload (staging) → verify → co
 State is persisted in `~/.trove/sync.sqlite`. Job ids are UUIDs printed during
 `plan` or the one-shot path.
 
+`plan`, `commit`, and `resume` reconcile the local archive cache against the
+bucket before their dedupe checks run (default on). This is what makes
+duplicate detection actually archive-wide rather than only as good as
+whatever this machine's cache already happened to contain — without it, a
+fresh machine or a stale cache could mint a second archive entry for content
+another machine already committed. Pass the global `--offline` flag to skip
+this and serve the last cached index instead (same fallback semantics as
+`archive pull-index --offline`); dedupe then only sees what's already local.
+
 ## Command reference
 
 ```bash
