@@ -11,6 +11,11 @@ code, the ADRs, or `make help` instead.
 - **Read the ADRs in `docs/adr/`.** They are the source of truth for the
   architecture and the running record of decisions. Read in order; the latest
   ones describe current state and open follow-ups.
+- **Read `docs/recall/`** for episodic session memory — what actually happened
+  last, what failed, and the next action. It is not architecture; ADRs still win
+  on decisions. **Never write a Recall note unless the user explicitly asks.**
+  Do not auto-record sessions, recaps, or "next actions" into `docs/recall/` at
+  the end of a chat or as a courtesy.
 - **Discover the structure, don't memorize it.** Skim the tree and run
   `make help`. Any map written here would go stale — explore instead.
 
@@ -53,6 +58,9 @@ what lets a fix land once and surface everywhere.
   exact targets — all are expected to stay green.
 - Record consequential decisions as a **new** ADR; don't rewrite old ones. Leave
   a short, honest trail of what's real vs. deferred.
+- **Episodic memory is opt-in.** Write to `docs/recall/` only when the user
+  prompts it (for example "record this in Recall"). Never create or update a
+  Recall note unprompted.
 
 ## Finding what's unfinished
 

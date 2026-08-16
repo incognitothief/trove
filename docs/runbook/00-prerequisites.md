@@ -10,12 +10,20 @@ make deps
 make build
 ```
 
-For a real S3 bucket, build with the S3 feature:
+For a real S3 bucket, build **and invoke** with the S3 feature:
 
 ```bash
 make build CARGO_FEATURES=s3
-# or per-invocation:
+```
+
+`bin/trove` wraps `cargo run` and only passes `--features s3` when
+`CARGO_FEATURES=s3` is set **in the environment for that command**. A one-time
+build with S3 does not stick — prefix every real-bucket invocation:
+
+```bash
 CARGO_FEATURES=s3 bin/trove archive pull-index
+CARGO_FEATURES=s3 bin/trove import ~/Music
+CARGO_FEATURES=s3 scripts/import-batch.sh ~/Music/DJ-Crates
 ```
 
 ## Invoke the CLI
