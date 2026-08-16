@@ -114,6 +114,20 @@ impl Trove {
         self.archive.get(id)
     }
 
+    /// Reconcile, then check every indexed entry actually has a
+    /// correctly-sized object in the bucket. `deep` re-downloads and
+    /// re-hashes every object instead of only checking presence/size — a
+    /// full read of the archive, expensive, opt-in only (ADR 007, Group B2).
+    pub fn archive_verify(
+        &mut self,
+        allow_offline: bool,
+        deep: bool,
+    ) -> Result<crate::archive::ArchiveVerifyReport> {
+        self.reconcile(allow_offline)?;
+        let entries = self.archive.all()?;
+        crate::archive::verify_archive(self.store.as_ref(), &entries, deep)
+    }
+
     // --- Playlists -------------------------------------------------------
 
     pub fn playlist_create(&self, name: &str) -> Result<Playlist> {
@@ -438,6 +452,7 @@ impl Trove {
             &mut job,
             self.store.as_ref(),
             Some(&self.import_db),
+            false,
             progress,
         )?;
         self.import_db.save_job(&job, &options)?;
@@ -447,10 +462,13 @@ impl Trove {
         Ok(job)
     }
 
-    /// Re-verify staged objects for a persisted job.
+    /// Re-verify staged objects for a persisted job. `deep` re-downloads and
+    /// re-hashes each object instead of only checking size/presence — see
+    /// `import::verify`'s doc comment for the cost/correctness trade-off.
     pub fn import_verify_job(
         &mut self,
         job_id: &str,
+        deep: bool,
         progress: &mut dyn ImportProgress,
     ) -> Result<ImportJob> {
         let (mut job, options) = self.import_db.load_job(job_id)?;
@@ -458,6 +476,7 @@ impl Trove {
             &mut job,
             self.store.as_ref(),
             Some(&self.import_db),
+            deep,
             progress,
         )?;
         self.import_db.save_job(&job, &options)?;
@@ -578,7 +597,13 @@ impl Trove {
             Some(&self.import_db),
             progress,
         )?;
-        import::verify(job, self.store.as_ref(), Some(&self.import_db), progress)?;
+        import::verify(
+            job,
+            self.store.as_ref(),
+            Some(&self.import_db),
+            false,
+            progress,
+        )?;
         let committed = import::commit(
             job,
             self.store.as_ref(),

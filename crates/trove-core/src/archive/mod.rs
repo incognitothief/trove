@@ -11,9 +11,11 @@
 
 pub mod index;
 pub mod reconcile;
+pub mod verify;
 
 pub use index::{BucketPaths, ARCHIVE_INDEX_SQLITE, SCHEMA_VERSION_JSON};
 pub use reconcile::{reconcile, ReconcileReport};
+pub use verify::{verify_archive, ArchiveVerifyReport};
 
 /// The schema version this build writes and understands.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;

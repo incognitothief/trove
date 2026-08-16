@@ -7,9 +7,9 @@ is a disposable cache; reconciliation keeps it aligned with
 ## Commands
 
 ```bash
-bin/trove archive pull-index    # reconcile local cache ← bucket
-bin/trove archive push-index    # push local index → bucket (new generation)
-bin/trove archive verify        # NOT IMPLEMENTED (stub)
+bin/trove archive pull-index         # reconcile local cache ← bucket
+bin/trove archive push-index         # push local index → bucket (new generation)
+bin/trove archive verify [--deep]    # presence+size (default) or re-hash every object (--deep)
 ```
 
 Global flags: `--json`, `--offline` (see [README](README.md#global-flags)).
@@ -47,9 +47,10 @@ bin/trove archive push-index
 # → pushed canonical index at generation N
 ```
 
-**Warning:** concurrent `push-index` from multiple machines can race on
-`schema-version.json` (known gap — see ADR 999). Serialize pushes until
-compare-and-swap lands.
+Concurrent `push-index` from multiple machines is safe: the canonical index
+is compare-and-swap protected (an immutable, generation-keyed object plus a
+CAS'd `schema-version.json` pointer) — a losing writer retries against the
+now-current state rather than silently clobbering the winner's entries.
 
 ## Offline reads
 
@@ -81,18 +82,24 @@ are **not** in the bucket today — those are lost unless you have a backup of
 
 1. `bin/trove archive pull-index` — force rehydrate from bucket.
 2. If still wrong, inspect bucket objects under `.trove/` prefix manually.
-3. `archive verify` (when implemented) will checksum every indexed object.
+3. `bin/trove archive verify --deep` checksums every indexed object.
 
-## `archive verify` (not implemented)
+## `archive verify`
 
 ```bash
-bin/trove archive verify
-# error: archive verify is not implemented in this bootstrap yet
+bin/trove archive verify         # presence + size only (fast)
+bin/trove archive verify --deep  # + re-download and re-hash every object (slow, thorough)
 ```
 
-Planned behavior: every `sha256` in the index exists in the bucket; optional
-byte re-read vs hash; report orphans and drift. Use `import verify <job-id>` for
-in-flight staging objects only.
+Reconciles first, then checks every entry in the local (now-fresh) index
+against the bucket: `missing` (indexed but no object at `object_key`),
+`size mismatch` (object exists, wrong size), and — `--deep` only —
+`hash mismatch` (object exists, right size, but a fresh SHA-256 doesn't match
+the indexed one; catches corruption a size check can't). Exits non-zero and
+lists affected track ids if anything's wrong. `--deep` reads every object in
+the archive — expensive on a large library, not something to run casually.
+Use `import verify <job-id> [--deep]` instead for in-flight staging objects
+only (before they're part of the canonical index at all).
 
 ## JSON output
 

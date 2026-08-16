@@ -554,11 +554,19 @@ pub fn upload(
     Ok(())
 }
 
-/// Verify uploaded objects by size (and presence) before commit.
+/// Verify uploaded objects by size (and presence) before commit, or — when
+/// `deep` is set — by re-downloading and re-hashing each object and
+/// comparing against the SHA-256 computed at fingerprint time. Size/presence
+/// alone (the default) is cheap but weak: a truncated or bit-flipped upload
+/// with the right byte count would pass. `deep` actually verifies the
+/// content-addressed identity ADR 004 relies on, at the cost of re-reading
+/// every byte — expensive, and meant to be opted into explicitly (ADR 007,
+/// Group B2), not run by default on every `import run`.
 pub fn verify(
     job: &mut ImportJob,
     store: &dyn ObjectStore,
     db: Option<&ImportDb>,
+    deep: bool,
     progress: &mut dyn ImportProgress,
 ) -> Result<()> {
     job.phase = Phase::Verify;
@@ -592,13 +600,25 @@ pub fn verify(
             }
         };
 
+        let expected_sha = file.sha256.clone();
         let verify_result = retry_store(
             || match store.head(&key)? {
-                Some(meta) if meta.size_bytes == file.size => Ok(()),
-                Some(meta) => Err(Error::store(format!(
+                Some(meta) if meta.size_bytes != file.size => Err(Error::store(format!(
                     "size mismatch for {key}: expected {} got {}",
                     file.size, meta.size_bytes
                 ))),
+                Some(_) if deep => {
+                    let bytes = store.get(&key)?;
+                    let actual_sha = hash_bytes(&bytes);
+                    if actual_sha == expected_sha {
+                        Ok(())
+                    } else {
+                        Err(Error::store(format!(
+                            "content hash mismatch for {key}: expected {expected_sha} got {actual_sha}"
+                        )))
+                    }
+                }
+                Some(_) => Ok(()),
                 None => Err(Error::not_found(key.clone())),
             },
             &mut file.attempts,
@@ -880,7 +900,7 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())

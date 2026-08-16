@@ -213,11 +213,17 @@ Prune only after the job is `done` or abandoned.
 ## Verify staging before commit
 
 ```bash
-bin/trove import verify <job-id>
+bin/trove import verify <job-id>              # presence + size (fast, default)
+bin/trove import verify <job-id> --deep        # + re-download and re-hash (slow, thorough)
 ```
 
-Re-runs head/size checks on staged objects. Verification is **weak** today:
-presence + size via `head` only — no re-download SHA-256 compare (known gap).
+Default verification is presence + size via `head` only — cheap, but it
+can't catch a truncated or bit-flipped upload that happens to land at the
+right byte count. `--deep` re-downloads each staged object and compares a
+fresh SHA-256 against the hash computed at fingerprint time — the real
+content-addressed identity check, at the cost of reading every byte again.
+Same trade-off applies to `bin/trove archive verify [--deep]` (see the
+[archive runbook](01-archive.md)).
 
 ## JSON / automation
 

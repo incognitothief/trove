@@ -58,7 +58,12 @@ enum ArchiveCmd {
     /// Push the local archive index up as the new canonical generation.
     PushIndex,
     /// Verify the archive index against stored objects.
-    Verify,
+    Verify {
+        /// Re-download and re-hash every object instead of only checking
+        /// presence/size (expensive — a full read of the archive).
+        #[arg(long)]
+        deep: bool,
+    },
 }
 
 #[derive(Args)]
@@ -83,7 +88,12 @@ enum ImportCmd {
     /// Upload + verify staged objects (no commit).
     Run { job_id: String },
     /// Re-verify staged objects.
-    Verify { job_id: String },
+    Verify {
+        job_id: String,
+        /// Re-download and re-hash instead of only checking presence/size.
+        #[arg(long)]
+        deep: bool,
+    },
     /// Promote verified objects and advance the archive index.
     Commit { job_id: String },
     /// Continue upload + verify from the last safe state.
@@ -245,11 +255,42 @@ fn archive(cli: &Cli, cmd: &ArchiveCmd) -> Result<()> {
             let generation = trove.push_index()?;
             println!("pushed canonical index at generation {generation}");
         }
-        ArchiveCmd::Verify => {
-            anyhow::bail!("archive verify is not implemented in this bootstrap yet");
+        ArchiveCmd::Verify { deep } => {
+            let report = trove.archive_verify(cli.offline, *deep)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "{}/{} verified{}",
+                    report.verified,
+                    report.total,
+                    if report.deep { " (deep)" } else { "" }
+                );
+                print_track_ids("missing", &report.missing);
+                print_track_ids("size mismatch", &report.size_mismatch);
+                print_track_ids("hash mismatch", &report.hash_mismatch);
+            }
+            if !report.is_clean() {
+                anyhow::bail!(
+                    "archive verify found {} problem(s)",
+                    report.missing.len() + report.size_mismatch.len() + report.hash_mismatch.len()
+                );
+            }
         }
     }
     Ok(())
+}
+
+fn print_track_ids(label: &str, ids: &[TrackId]) {
+    if ids.is_empty() {
+        return;
+    }
+    let joined = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("  {label} ({}): {joined}", ids.len());
 }
 
 fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
@@ -306,9 +347,9 @@ fn import(cli: &Cli, args: &ImportArgs) -> Result<()> {
                 .with_context(|| format!("running import job {job_id}"))?;
             print_run_result(&job, cli.json);
         }
-        ImportCmd::Verify { job_id } => {
+        ImportCmd::Verify { job_id, deep } => {
             let job = trove
-                .import_verify_job(job_id, progress)
+                .import_verify_job(job_id, *deep, progress)
                 .with_context(|| format!("verifying import job {job_id}"))?;
             print_run_result(&job, cli.json);
         }
