@@ -22,6 +22,18 @@ another machine already committed. Pass the global `--offline` flag to skip
 this and serve the last cached index instead (same fallback semantics as
 `archive pull-index --offline`); dedupe then only sees what's already local.
 
+`plan` also keeps a persistent local fingerprint cache
+(`~/.trove/fingerprint_cache.sqlite`), keyed by `(path, size, mtime)` and
+independent of any job. Re-running `plan` against a path you've already
+scanned — even in a brand-new job, not a resume — reuses the recorded SHA-256
+instead of re-reading the file, as long as its size and modification time
+haven't changed. This is separate from (and in addition to) the per-job
+resume cache: that one only helps within a single interrupted-then-resumed
+job; this one helps across completely separate `trove import` invocations,
+which is the common case for a repeat backfill or re-scanning the same
+drive. Purely a performance cache — deleting it is always safe, just costs a
+future re-hash.
+
 ## Command reference
 
 ```bash

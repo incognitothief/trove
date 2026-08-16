@@ -176,6 +176,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -204,6 +205,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -221,6 +223,7 @@ mod tests {
             &track,
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
             &ImportOptions::default(),
+            None,
             None,
             None,
             None,
@@ -249,6 +252,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -268,6 +272,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -281,10 +286,95 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
         assert_eq!(folder_job.artwork.len(), 1);
+    }
+
+    #[test]
+    fn import_plan_populates_fingerprint_cache_keyed_by_path_size_mtime() {
+        use crate::db::fingerprint::FingerprintCache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.mp3");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let cache = FingerprintCache::in_memory().unwrap();
+        let mut progress = NoopImportProgress;
+
+        let job = crate::import::plan(
+            dir.path(),
+            crate::import::DEFAULT_AUDIO_EXTENSIONS,
+            &ImportOptions::default(),
+            None,
+            None,
+            Some(&cache),
+            None,
+            &mut progress,
+        )
+        .unwrap();
+        let expected_sha = crate::import::hash_bytes(b"original bytes");
+        assert_eq!(job.files[0].sha256, expected_sha);
+
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()));
+        assert_eq!(
+            cache.lookup(&path, meta.len(), mtime.as_deref()).unwrap(),
+            Some(expected_sha),
+            "plan() must record the fingerprint it just computed, keyed by \
+             exactly the (path, size, mtime) a later lookup would use"
+        );
+    }
+
+    #[test]
+    fn import_plan_trusts_a_cached_fingerprint_over_the_files_actual_bytes() {
+        use crate::db::fingerprint::FingerprintCache;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("track.mp3");
+        std::fs::write(&path, b"whatever bytes are on disk").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| format!("{}.{:09}", d.as_secs(), d.subsec_nanos()));
+
+        // Poison the cache with a hash that does *not* match the file's real
+        // bytes, at exactly the (path, size, mtime) key a real plan() call
+        // would look up. This directly proves plan() trusts a cache hit
+        // instead of independently re-hashing — a much stronger and more
+        // deterministic check than trying to race file corruption against
+        // mtime, which real filesystems don't let a test control precisely.
+        let cache = FingerprintCache::in_memory().unwrap();
+        cache
+            .upsert(&path, meta.len(), mtime.as_deref(), "poisoned-hash-proves-cache-was-trusted")
+            .unwrap();
+
+        let mut progress = NoopImportProgress;
+        let job = crate::import::plan(
+            dir.path(),
+            crate::import::DEFAULT_AUDIO_EXTENSIONS,
+            &ImportOptions::default(),
+            None,
+            None,
+            Some(&cache),
+            None,
+            &mut progress,
+        )
+        .unwrap();
+
+        assert_eq!(
+            job.files[0].sha256, "poisoned-hash-proves-cache-was-trusted",
+            "a fresh plan() against a path matching a cached (size, mtime) must \
+             reuse the cached fingerprint rather than reading and re-hashing \
+             the file itself"
+        );
     }
 
     #[test]

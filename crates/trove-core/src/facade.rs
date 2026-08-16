@@ -13,6 +13,7 @@ use crate::archive::reconcile::{reconcile, ReconcileReport};
 use crate::archive::CURRENT_SCHEMA_VERSION;
 use crate::config::Config;
 use crate::db::archive::ArchiveDb;
+use crate::db::fingerprint::FingerprintCache;
 use crate::db::import::{ImportDb, ImportJobSummary, ImportStatusReport};
 use crate::db::transfer::TransferDb;
 use crate::db::volume::VolumeFileStats;
@@ -37,6 +38,7 @@ pub struct Trove {
     playlists: PlaylistDb,
     import_db: ImportDb,
     transfer_db: TransferDb,
+    fingerprint_cache: FingerprintCache,
     store: Box<dyn ObjectStore>,
     extractor: Box<dyn MetadataExtractor>,
 }
@@ -56,6 +58,7 @@ impl Trove {
         let playlists = PlaylistDb::open(&home.join("playlists.sqlite"))?;
         let import_db = ImportDb::open(&home.join("sync.sqlite"))?;
         let transfer_db = TransferDb::open(&home.join("sync.sqlite"))?;
+        let fingerprint_cache = FingerprintCache::open(&home.join("fingerprint_cache.sqlite"))?;
         Ok(Trove {
             config,
             home: home.to_path_buf(),
@@ -64,6 +67,7 @@ impl Trove {
             playlists,
             import_db,
             transfer_db,
+            fingerprint_cache,
             store,
             extractor: Box::new(StubExtractor),
         })
@@ -88,6 +92,7 @@ impl Trove {
             playlists: PlaylistDb::in_memory()?,
             import_db: ImportDb::in_memory()?,
             transfer_db: TransferDb::in_memory()?,
+            fingerprint_cache: FingerprintCache::in_memory()?,
             store,
             extractor: Box::new(StubExtractor),
         })
@@ -393,6 +398,7 @@ impl Trove {
             options,
             Some(&self.archive),
             Some(&self.import_db),
+            Some(&self.fingerprint_cache),
             None,
             progress,
         )?;
@@ -422,6 +428,7 @@ impl Trove {
             &options,
             Some(&self.archive),
             Some(&self.import_db),
+            Some(&self.fingerprint_cache),
             Some(job_id),
             progress,
         )?;

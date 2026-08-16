@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::archive::index::BucketPaths;
 use crate::db::archive::ArchiveDb;
+use crate::db::fingerprint::FingerprintCache;
 use crate::db::import::ImportDb;
 use crate::error::{Error, Result};
 use crate::metadata::MetadataExtractor;
@@ -143,12 +144,27 @@ const MAX_STORE_ATTEMPTS: u32 = 5;
 /// When `db` is provided, the job shell and per-file rows are persisted
 /// incrementally so an interrupt during fingerprinting remains resumable.
 /// Pass `resume_job_id` to continue an in-flight plan.
+///
+/// `fingerprint_cache`, when provided, is checked by `(path, size, mtime)`
+/// before reading a newly discovered file's bytes — distinct from the
+/// job-scoped resume cache above (`can_skip_fingerprint`), which only covers
+/// re-fingerprinting *within* a single resumed job. This one is job-independent
+/// and persists across separate `trove import` invocations, so re-scanning an
+/// unchanged path — the common case for a repeat backfill or a re-run against
+/// the same drive — skips the read+hash entirely instead of paying full price
+/// every time (ADR 007, Group C1).
+// Eight params, all but the first three optional context (archive/db/cache)
+// or resume state — bundling them into a struct would touch every call site
+// for no clarity gain over the existing `Option<&T>` pattern already used
+// throughout this module.
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     source_root: &Path,
     extensions: &[&str],
     options: &ImportOptions,
     archive: Option<&ArchiveDb>,
     db: Option<&ImportDb>,
+    fingerprint_cache: Option<&FingerprintCache>,
     resume_job_id: Option<&str>,
     progress: &mut dyn ImportProgress,
 ) -> Result<ImportJob> {
@@ -237,8 +253,23 @@ pub fn plan(
         let meta = std::fs::metadata(path)?;
         file.size = meta.len();
         file.mtime = file_mtime_from_meta(&meta);
-        let bytes = std::fs::read(path)?;
-        file.sha256 = hash_bytes(&bytes);
+
+        let cached_sha = fingerprint_cache
+            .and_then(|cache| cache.lookup(path, file.size, file.mtime.as_deref()).ok())
+            .flatten();
+        file.sha256 = match cached_sha {
+            Some(sha) => sha,
+            None => {
+                let bytes = std::fs::read(path)?;
+                let sha = hash_bytes(&bytes);
+                if let Some(cache) = fingerprint_cache {
+                    // Best-effort: a cache write failure shouldn't fail the
+                    // import, only cost a future re-hash.
+                    let _ = cache.upsert(path, file.size, file.mtime.as_deref(), &sha);
+                }
+                sha
+            }
+        };
         let already_in_archive = match archive {
             Some(db) => db.find_by_sha256(&file.sha256)?.is_some(),
             None => false,

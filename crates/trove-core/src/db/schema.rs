@@ -39,6 +39,21 @@ CREATE INDEX IF NOT EXISTS idx_tracks_key    ON tracks(key_camelot);
 CREATE INDEX IF NOT EXISTS idx_tracks_sha256 ON tracks(sha256);
 "#;
 
+/// `~/.trove/fingerprint_cache.sqlite` — persistent, path-keyed
+/// (size, mtime) → sha256 cache, independent of any import job (ADR 007,
+/// Group C1). Closes the gap where re-scanning an unchanged path in a fresh
+/// `trove import` invocation always re-read and re-hashed every file, since
+/// `can_skip_fingerprint`'s resume cache only covers a single resumed job.
+pub const FINGERPRINT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS fingerprints (
+    path       TEXT PRIMARY KEY,
+    size_bytes INTEGER NOT NULL,
+    mtime      TEXT,
+    sha256     TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+"#;
+
 /// `~/.trove/playlists.sqlite` — logical Trove playlists/crates.
 pub const PLAYLISTS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS playlists (
