@@ -256,7 +256,17 @@ fn archive(cli: &Cli, cmd: &ArchiveCmd) -> Result<()> {
             println!("pushed canonical index at generation {generation}");
         }
         ArchiveCmd::Verify { deep } => {
-            let report = trove.archive_verify(cli.offline, *deep)?;
+            // A `--deep` pass over a real archive is a genuinely long,
+            // network-bound operation (full re-download of every object) —
+            // real progress output matters here, not just at the end.
+            let mut cli_progress = import_progress::CliImportProgress::new();
+            let mut noop = trove_core::NoopImportProgress;
+            let progress: &mut dyn trove_core::import::ImportProgress = if cli.json {
+                &mut noop
+            } else {
+                &mut cli_progress
+            };
+            let report = trove.archive_verify(cli.offline, *deep, progress)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

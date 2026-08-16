@@ -127,10 +127,11 @@ impl Trove {
         &mut self,
         allow_offline: bool,
         deep: bool,
+        progress: &mut dyn ImportProgress,
     ) -> Result<crate::archive::ArchiveVerifyReport> {
         self.reconcile(allow_offline)?;
         let entries = self.archive.all()?;
-        crate::archive::verify_archive(self.store.as_ref(), &entries, deep)
+        crate::archive::verify_archive(self.store.as_ref(), &entries, deep, progress)
     }
 
     // --- Playlists -------------------------------------------------------

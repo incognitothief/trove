@@ -6,9 +6,12 @@
 //! correct and pulls it; this checks whether the index's claims about the
 //! bucket are actually true.
 
+use std::path::Path;
+
 use serde::Serialize;
 
 use crate::error::Result;
+use crate::import::{FileState, ImportProgress, Phase, ProgressCtx};
 use crate::model::{ArchiveEntry, TrackId};
 use crate::store::ObjectStore;
 
@@ -39,10 +42,20 @@ impl ArchiveVerifyReport {
 /// re-hashes each object instead of only checking presence/size — expensive
 /// (a full read of every object in the archive), so it's opt-in, never the
 /// default for a large archive.
+///
+/// Reports progress through `progress` exactly like import does (same
+/// `ImportProgress` trait, same `ProgressCtx`) — a `deep` pass over a large
+/// archive is a genuinely long-running, network-bound operation with no
+/// intermediate output otherwise, which is a real problem on a multi-hour
+/// run: no way to tell it's progressing versus hung. There's no real "job"
+/// here, so `job_id` is a fixed label rather than a persisted job id, and
+/// `Phase::Verify` is reused rather than adding an import-job-specific
+/// concept that doesn't apply to archive-wide verification.
 pub fn verify_archive(
     store: &dyn ObjectStore,
     entries: &[ArchiveEntry],
     deep: bool,
+    progress: &mut dyn ImportProgress,
 ) -> Result<ArchiveVerifyReport> {
     let mut report = ArchiveVerifyReport {
         total: entries.len(),
@@ -50,24 +63,47 @@ pub fn verify_archive(
         ..Default::default()
     };
 
-    for entry in entries {
-        match store.head(&entry.object_key)? {
-            None => report.missing.push(entry.track_id.clone()),
+    let mut progress = ProgressCtx::new("archive-verify", Some(progress));
+    progress.phase_start(Phase::Verify, entries.len());
+
+    for (done, entry) in entries.iter().enumerate() {
+        let display_path = entry
+            .source_path_original
+            .as_deref()
+            .map(Path::new)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| Path::new(&entry.object_key).to_path_buf());
+
+        let state = match store.head(&entry.object_key)? {
+            None => {
+                report.missing.push(entry.track_id.clone());
+                FileState::Failed
+            }
             Some(meta) if meta.size_bytes != entry.size_bytes => {
-                report.size_mismatch.push(entry.track_id.clone())
+                report.size_mismatch.push(entry.track_id.clone());
+                FileState::Failed
             }
             Some(_) if deep => {
                 let bytes = store.get(&entry.object_key)?;
                 let actual_sha = crate::import::hash_bytes(&bytes);
                 if actual_sha == entry.sha256 {
                     report.verified += 1;
+                    FileState::Verified
                 } else {
                     report.hash_mismatch.push(entry.track_id.clone());
+                    FileState::Failed
                 }
             }
-            Some(_) => report.verified += 1,
-        }
+            Some(_) => {
+                report.verified += 1;
+                FileState::Verified
+            }
+        };
+
+        progress.file_done(Phase::Verify, done + 1, entries.len(), &display_path, state);
     }
+
+    progress.phase_done(Phase::Verify, entries.len(), entries.len());
 
     Ok(report)
 }
@@ -105,7 +141,7 @@ mod tests {
             entry("b", "music/b.mp3", "deadbeef", 5),
         ];
 
-        let report = verify_archive(&store, &entries, false).unwrap();
+        let report = verify_archive(&store, &entries, false, &mut crate::import::NoopImportProgress).unwrap();
         assert!(!report.is_clean());
         assert_eq!(report.missing, vec![TrackId::from("b")]);
         assert_eq!(report.size_mismatch, vec![TrackId::from("a")]);
@@ -126,13 +162,13 @@ mod tests {
             11,
         )];
 
-        let shallow = verify_archive(&store, &entries, false).unwrap();
+        let shallow = verify_archive(&store, &entries, false, &mut crate::import::NoopImportProgress).unwrap();
         assert!(
             shallow.is_clean(),
             "shallow mode can't see content corruption — size matches"
         );
 
-        let deep = verify_archive(&store, &entries, true).unwrap();
+        let deep = verify_archive(&store, &entries, true, &mut crate::import::NoopImportProgress).unwrap();
         assert!(!deep.is_clean());
         assert_eq!(deep.hash_mismatch, vec![TrackId::from("c")]);
     }
@@ -148,7 +184,7 @@ mod tests {
             12,
         )];
 
-        let report = verify_archive(&store, &entries, true).unwrap();
+        let report = verify_archive(&store, &entries, true, &mut crate::import::NoopImportProgress).unwrap();
         assert!(report.is_clean());
         assert_eq!(report.verified, 1);
     }
