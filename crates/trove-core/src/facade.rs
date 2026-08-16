@@ -119,6 +119,26 @@ impl Trove {
         self.archive.get(id)
     }
 
+    /// The declared library root, if one has been set (ADR 007, Group D1) —
+    /// the stable anchor `library_relative_path` (Group D2), the shape scan
+    /// (Group E1), and the backfill Plan (Group E2) all compute portable
+    /// identity relative to, instead of whatever path a given command's own
+    /// arguments happened to be pointed at.
+    pub fn library_root(&self) -> Option<&Path> {
+        self.config.library.root.as_deref()
+    }
+
+    /// Declare (or change) the library root: persists it to this Trove's own
+    /// `config.toml` (`<home>/config.toml`, the same file every other client
+    /// reads) and updates the in-memory config so it takes effect
+    /// immediately for the rest of this process, without requiring a
+    /// restart to pick up the file change.
+    pub fn set_library_root(&mut self, root: &Path) -> Result<()> {
+        crate::config::set_library_root(&self.home.join("config.toml"), root)?;
+        self.config.library.root = Some(root.to_path_buf());
+        Ok(())
+    }
+
     /// Reconcile, then check every indexed entry actually has a
     /// correctly-sized object in the bucket. `deep` re-downloads and
     /// re-hashes every object instead of only checking presence/size — a

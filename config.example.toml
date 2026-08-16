@@ -38,6 +38,14 @@ include_dotfiles = false
 # measure, since folder art lives only on the disposable source device.
 capture_artwork = true
 
+# The stable anchor for portable, cross-drive identity (ADR 007, Group D1):
+# things like relative-path identity for recognizing "the same library,
+# remounted somewhere else" are computed relative to this, not to whatever
+# path a given `import` command happens to be pointed at. Usually set via
+# `trove library root --set <path>` rather than hand-edited.
+# [library]
+# root = "/Volumes/T7/music/library"
+
 # Named profiles let you point at multiple buckets/regions.
 # [profiles.touring]
 # bucket = "touring-archive"

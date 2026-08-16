@@ -23,14 +23,7 @@ pub fn trove_home() -> Result<PathBuf> {
 pub fn load_config() -> Result<Config> {
     match Config::load_default() {
         Ok(cfg) => Ok(cfg),
-        Err(_) => Config::from_toml(
-            r#"
-            [bucket]
-            name = "local"
-            region = "local"
-            "#,
-        )
-        .context("building default config"),
+        Err(_) => Config::from_toml(config::LOCAL_DEFAULT_TOML).context("building default config"),
     }
 }
 

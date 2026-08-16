@@ -28,6 +28,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Format-preserving TOML edits (comments/ordering intact) -- used only where
+# Trove writes back to the operator's own config.toml, never for ordinary
+# parsing (see config::set_library_root, ADR 007 Group D1).
+toml_edit = "0.22"
 
 # Storage / hashing / ids
 rusqlite = { version = "0.32", features = ["bundled"] }

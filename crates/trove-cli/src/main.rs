@@ -49,6 +49,22 @@ enum Command {
     /// Flash/sync tracks to a mounted volume.
     #[command(subcommand)]
     Sync(SyncCmd),
+    /// Manage the declared library root and (future) backfill coordination.
+    #[command(subcommand)]
+    Library(LibraryCmd),
+}
+
+#[derive(Subcommand)]
+enum LibraryCmd {
+    /// Show or declare the library root (ADR 007, Group D1) — the stable
+    /// anchor cross-drive identity and backfill coordination are computed
+    /// relative to, separate from whatever path a given `import` command
+    /// happens to be pointed at.
+    Root {
+        /// Declare a new library root, persisting it to config.toml.
+        #[arg(long, value_name = "PATH")]
+        set: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,7 +257,54 @@ fn run(cli: &Cli) -> Result<()> {
         Command::Playlist(cmd) => playlist(cli, cmd),
         Command::Volume(cmd) => volume(cli, cmd),
         Command::Sync(cmd) => sync(cli, cmd),
+        Command::Library(cmd) => library(cli, cmd),
     }
+}
+
+fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
+    // Deliberately does NOT go through runtime::open_trove(): declaring or
+    // reading the library root is a pure local-config operation and must
+    // not require a live bucket connection (no S3 credentials, no network,
+    // no `--features s3` build) just to run — unlike every other command
+    // here, which legitimately needs an open Trove.
+    match cmd {
+        LibraryCmd::Root { set } => {
+            let config_path = runtime::trove_home()?.join("config.toml");
+            if let Some(path) = set {
+                let root = std::path::Path::new(path);
+                trove_core::config::set_library_root(&config_path, root)
+                    .with_context(|| format!("setting library root to {path}"))?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({ "root": path }))?
+                    );
+                } else {
+                    println!("library root set to {path}");
+                }
+            } else {
+                let root = runtime::load_config()?
+                    .library
+                    .root
+                    .map(|p| p.display().to_string());
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({ "root": root }))?
+                    );
+                } else {
+                    match root {
+                        Some(root) => println!("{root}"),
+                        None => println!(
+                            "no library root declared — set one with \
+                             `trove library root --set <path>`"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn archive(cli: &Cli, cmd: &ArchiveCmd) -> Result<()> {

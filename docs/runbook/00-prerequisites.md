@@ -116,6 +116,12 @@ the `s3` feature (`CARGO_FEATURES=s3`).
 | `include_dotfiles` | no | `false` | Include hidden files/dirs in import scans |
 | `capture_artwork` | no | `true` | Capture co-located cover art during import |
 
+#### `[library]` — optional
+
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `root` | no | (none) | Declared library root (ADR 007, Group D1) — the anchor cross-drive identity is computed relative to. Usually set via `trove library root --set <path>` rather than hand-edited; `trove library root` with no flag shows the current value. |
+
 #### `[profiles.<name>]` — optional
 
 Named alternate bucket targets. Each profile requires `bucket` and `region`;

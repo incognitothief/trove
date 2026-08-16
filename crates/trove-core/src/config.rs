@@ -24,7 +24,25 @@ pub struct Config {
     #[serde(default)]
     pub import: ImportConfig,
     #[serde(default)]
+    pub library: LibraryConfig,
+    #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+}
+
+/// The stable anchor for portable, cross-drive identity (ADR 007, Group D1).
+///
+/// `ImportJob.source_root` is just whatever path a given `trove import`
+/// invocation happened to be pointed at — it isn't stable across differently
+/// granular invocations (a whole-tree import vs. a batch import chunked by
+/// subdirectory compute different `source_root`s for identical files). The
+/// library root is a separate, explicitly declared concept: everything that
+/// needs a portable "path relative to the library" (the D2 slug, the E1
+/// shape scan, the E2 backfill Plan) is computed relative to *this*, not to
+/// whatever a particular command's own arguments happened to be.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LibraryConfig {
+    #[serde(default)]
+    pub root: Option<PathBuf>,
 }
 
 /// Import-time behavior. See ADR 002.
@@ -138,6 +156,16 @@ fn default_true() -> bool {
     true
 }
 
+/// The local, no-AWS-required default Trove synthesizes in memory when no
+/// `config.toml` exists yet (see `trove-cli`'s `runtime::load_config`). Named
+/// here, once, so [`set_library_root`] can materialize the *same* default to
+/// disk on first write rather than duplicating this literal in a second
+/// place where it could silently drift.
+pub const LOCAL_DEFAULT_TOML: &str = r#"[bucket]
+name = "local"
+region = "local"
+"#;
+
 impl Config {
     /// Parse configuration from a TOML string.
     pub fn from_toml(s: &str) -> Result<Self> {
@@ -158,6 +186,45 @@ impl Config {
     }
 }
 
+/// Persist `root` as the declared library root (ADR 007, Group D1) into the
+/// config file at `path`, creating the file with the same local-default
+/// bucket stanza Trove already synthesizes in memory (see
+/// [`LOCAL_DEFAULT_TOML`]) if it doesn't exist yet.
+///
+/// Uses `toml_edit` rather than round-tripping through `Config`'s own
+/// (de)serialization: a full re-serialize would lose comments and silently
+/// drop any field this struct doesn't model, on a file that already holds
+/// real bucket credentials/settings the operator hand-edited. This only ever
+/// touches the one key it's asked to — everything else in the file, byte for
+/// byte, is left alone.
+pub fn set_library_root(path: &Path, root: &Path) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LOCAL_DEFAULT_TOML.to_string(),
+        Err(e) => {
+            return Err(Error::config(format!(
+                "could not read config at {}: {e}",
+                path.display()
+            )))
+        }
+    };
+
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| Error::config(format!("could not parse {}: {e}", path.display())))?;
+
+    if doc.get("library").and_then(|v| v.as_table()).is_none() {
+        doc["library"] = toml_edit::table();
+    }
+    doc["library"]["root"] = toml_edit::value(root.display().to_string());
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 /// Resolve `~/.trove`, the operational cache/config root.
 pub fn trove_home() -> Result<PathBuf> {
     if let Ok(explicit) = std::env::var("TROVE_HOME") {
@@ -171,4 +238,91 @@ pub fn trove_home() -> Result<PathBuf> {
 /// Default config path (`~/.trove/config.toml`).
 pub fn default_config_path() -> Result<PathBuf> {
     Ok(trove_home()?.join("config.toml"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_library_root_materializes_local_default_when_no_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(!path.exists());
+
+        set_library_root(&path, Path::new("/Volumes/T7/music/library")).unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            cfg.bucket.name, "local",
+            "should get the same local default Trove already synthesizes in memory"
+        );
+        assert_eq!(
+            cfg.library.root,
+            Some(PathBuf::from("/Volumes/T7/music/library"))
+        );
+    }
+
+    #[test]
+    fn set_library_root_preserves_existing_content_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# a hand-written comment the operator cares about
+[bucket]
+name = "my-real-bucket"
+region = "us-east-1"
+
+[export]
+layout = "flat"
+"#,
+        )
+        .unwrap();
+
+        set_library_root(&path, Path::new("/Volumes/T7/music/library")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# a hand-written comment the operator cares about"),
+            "must not lose comments on an existing config file:\n{text}"
+        );
+        assert!(text.contains("name = \"my-real-bucket\""));
+        assert!(text.contains("layout = \"flat\""));
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            cfg.bucket.name, "my-real-bucket",
+            "unrelated fields must be untouched"
+        );
+        assert_eq!(cfg.export.layout, ExportLayout::Flat);
+        assert_eq!(
+            cfg.library.root,
+            Some(PathBuf::from("/Volumes/T7/music/library"))
+        );
+    }
+
+    #[test]
+    fn set_library_root_overwrites_a_previously_declared_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        set_library_root(&path, Path::new("/Volumes/T7/music/library")).unwrap();
+        set_library_root(&path, Path::new("/Volumes/T72/choons")).unwrap();
+
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.library.root, Some(PathBuf::from("/Volumes/T72/choons")));
+    }
+
+    #[test]
+    fn config_without_a_library_section_parses_with_no_root_declared() {
+        let cfg = Config::from_toml(
+            r#"
+            [bucket]
+            name = "test"
+            region = "local"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.library.root, None);
+    }
 }
