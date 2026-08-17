@@ -992,7 +992,7 @@ fn scan_dir(
     Ok(())
 }
 
-fn is_hidden(path: &Path, include_dotfiles: bool) -> bool {
+pub(crate) fn is_hidden(path: &Path, include_dotfiles: bool) -> bool {
     if include_dotfiles {
         return false;
     }
@@ -1002,7 +1002,7 @@ fn is_hidden(path: &Path, include_dotfiles: bool) -> bool {
         .unwrap_or(false)
 }
 
-fn is_audio(path: &Path, extensions: &[&str]) -> bool {
+pub(crate) fn is_audio(path: &Path, extensions: &[&str]) -> bool {
     has_extension(path, extensions)
 }
 

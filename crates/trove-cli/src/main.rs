@@ -70,6 +70,19 @@ enum LibraryCmd {
     /// Local and offline-by-nature (no re-read/re-hash/re-upload) except for
     /// the reconcile and final index push.
     BackfillSlugs,
+    /// Read-only inspection of a library's structure — per-subtree file
+    /// counts, byte totals, and depth (ADR 007, Group E1). `readdir` +
+    /// `stat` only; never opens a file's contents. Defaults to the declared
+    /// library root when no path is given.
+    Shape {
+        /// Root to scan. Defaults to the declared library root.
+        #[arg(value_name = "PATH")]
+        root: Option<String>,
+        /// Include dotfiles / hidden directories (excluded by default,
+        /// matching `import`'s default).
+        #[arg(long)]
+        include_dotfiles: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -328,8 +341,102 @@ fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
                 );
             }
         }
+        // Also local-only: a shape scan is pure readdir/stat against the
+        // filesystem, no bucket or db involved.
+        LibraryCmd::Shape {
+            root,
+            include_dotfiles,
+        } => {
+            let root = match root {
+                Some(path) => std::path::PathBuf::from(path),
+                None => runtime::load_config()?
+                    .library
+                    .root
+                    .context("no path given and no library root declared — pass a path or run `trove library root --set <path>`")?,
+            };
+            let shape = trove_core::library::scan_library_shape(
+                &root,
+                &trove_core::library::ShapeOptions {
+                    include_dotfiles: *include_dotfiles,
+                },
+            )
+            .with_context(|| format!("scanning library shape at {}", root.display()))?;
+            print_library_shape(&shape, cli.json);
+        }
     }
     Ok(())
+}
+
+fn print_library_shape(shape: &trove_core::library::LibraryShape, json: bool) {
+    fn subtree_json(s: &trove_core::library::SubtreeShape) -> serde_json::Value {
+        serde_json::json!({
+            "relative_path": s.relative_path,
+            "audio_file_count": s.audio_file_count,
+            "audio_bytes": s.audio_bytes,
+            "total_file_count": s.total_file_count,
+            "total_bytes": s.total_bytes,
+            "max_depth": s.max_depth,
+        })
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "root": shape.root,
+                "subtrees": shape.subtrees.iter().map(subtree_json).collect::<Vec<_>>(),
+                "root_files": shape.root_files.as_ref().map(subtree_json),
+                "audio_file_count": shape.audio_file_count,
+                "audio_bytes": shape.audio_bytes,
+                "total_file_count": shape.total_file_count,
+                "total_bytes": shape.total_bytes,
+                "max_depth": shape.max_depth,
+            }))
+            .expect("serialize shape")
+        );
+        return;
+    }
+    println!(
+        "{}: {} audio file(s) ({}), {} file(s) total ({}), max depth {}",
+        shape.root.display(),
+        shape.audio_file_count,
+        format_bytes(shape.audio_bytes),
+        shape.total_file_count,
+        format_bytes(shape.total_bytes),
+        shape.max_depth,
+    );
+    if let Some(root_files) = &shape.root_files {
+        println!(
+            "  {:<40}  {:>6} audio  {:>10}  depth {}",
+            "(loose files in root)",
+            root_files.audio_file_count,
+            format_bytes(root_files.total_bytes),
+            root_files.max_depth,
+        );
+    }
+    for subtree in &shape.subtrees {
+        println!(
+            "  {:<40}  {:>6} audio  {:>10}  depth {}",
+            subtree.relative_path.as_deref().unwrap_or("?"),
+            subtree.audio_file_count,
+            format_bytes(subtree.total_bytes),
+            subtree.max_depth,
+        );
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn archive(cli: &Cli, cmd: &ArchiveCmd) -> Result<()> {
