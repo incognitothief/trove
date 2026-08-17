@@ -79,6 +79,18 @@ impl BucketPaths {
     pub fn backfill_plans_prefix(&self) -> String {
         self.join("backfill-plans/")
     }
+    /// Object key of one chunk-progress event (ADR 007, Group E3): a pure
+    /// create, uniquely keyed by `event_id`, appended under the plan it
+    /// belongs to. Never a read-modify-write — that's what lets this whole
+    /// coordination layer skip CAS entirely, unlike `schema-version.json`.
+    pub fn chunk_event(&self, plan_id: &str, event_id: &str) -> String {
+        self.join(&format!("backfill-plans/{plan_id}/events/{event_id}.json"))
+    }
+    /// Prefix under which a given plan's event log lives, for folding
+    /// current per-chunk status (`ObjectStore::list`).
+    pub fn chunk_events_prefix(&self, plan_id: &str) -> String {
+        self.join(&format!("backfill-plans/{plan_id}/events/"))
+    }
 }
 
 /// Serialize entries to the JSONL interchange format.

@@ -111,6 +111,11 @@ enum PlanCmd {
         #[arg(long, value_name = "PATH")]
         library_root: Option<String>,
     },
+    /// Per-chunk status (completed / claimed / untouched), folded from the
+    /// plan's append-only event log (ADR 007, Group E3). Reconstructable by
+    /// any machine, including one joining later — this is "what have I
+    /// missed."
+    Status { plan_id: String },
 }
 
 #[derive(Subcommand)]
@@ -442,8 +447,56 @@ fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
                 }
             }
         }
+        LibraryCmd::Plan(PlanCmd::Status { plan_id }) => {
+            let trove = runtime::open_trove()?;
+            let statuses = trove
+                .chunk_status(plan_id)
+                .with_context(|| format!("pulling status for plan {plan_id}"))?;
+            if cli.json {
+                fn status_json(s: &trove_core::library::ChunkStatus) -> serde_json::Value {
+                    fn event_json(e: &trove_core::library::ChunkEvent) -> serde_json::Value {
+                        serde_json::json!({ "by": e.by, "at": e.at, "event_id": e.event_id })
+                    }
+                    serde_json::json!({
+                        "chunk_id": s.chunk_id,
+                        "state": chunk_state_str(s.state),
+                        "claims": s.claims.iter().map(event_json).collect::<Vec<_>>(),
+                        "completions": s.completions.iter().map(event_json).collect::<Vec<_>>(),
+                    })
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &statuses.iter().map(status_json).collect::<Vec<_>>()
+                    )
+                    .expect("serialize status")
+                );
+            } else {
+                for status in &statuses {
+                    let detail = match (status.claims.last(), status.completions.last()) {
+                        (_, Some(c)) => format!("by {} at {}", c.by, c.at),
+                        (Some(c), None) => format!("by {} at {}", c.by, c.at),
+                        (None, None) => String::new(),
+                    };
+                    println!(
+                        "  {:>4}  {:<11}  {}",
+                        status.chunk_id,
+                        chunk_state_str(status.state),
+                        detail
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn chunk_state_str(state: trove_core::library::ChunkState) -> &'static str {
+    match state {
+        trove_core::library::ChunkState::Untouched => "untouched",
+        trove_core::library::ChunkState::Claimed => "claimed",
+        trove_core::library::ChunkState::Completed => "completed",
+    }
 }
 
 fn print_backfill_plan(plan: &trove_core::library::BackfillPlan, json: bool) {

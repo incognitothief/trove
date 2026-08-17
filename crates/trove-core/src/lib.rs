@@ -595,6 +595,144 @@ mod tests {
     }
 
     #[test]
+    fn records_chunk_events_and_folds_them_into_status_via_a_real_bucket_round_trip() {
+        use crate::library::{ChunkEventKind, ChunkState};
+        use std::sync::{Arc, Mutex};
+
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Artist A")).unwrap();
+        std::fs::create_dir_all(library.path().join("Artist B")).unwrap();
+        std::fs::write(library.path().join("Artist A/Track1.mp3"), b"12345").unwrap();
+        std::fs::write(library.path().join("Artist B/Track2.mp3"), b"123").unwrap();
+
+        let shared = Arc::new(Mutex::new(StubStore::new()));
+        let config = test_config();
+        let home = tempfile::tempdir().unwrap();
+        let mut trove = Trove::open_with_store(
+            config.clone(),
+            home.path(),
+            Box::new(SharedStub(shared.clone())),
+        )
+        .unwrap();
+        let plan = trove
+            .create_backfill_plan(library.path(), 1, &crate::library::ShapeOptions::default())
+            .unwrap();
+        assert_eq!(plan.chunks.len(), 2);
+        let chunk_0 = plan.chunks[0].chunk_id.clone();
+        let chunk_1 = plan.chunks[1].chunk_id.clone();
+
+        // Nothing touched yet -- every chunk is untouched.
+        let status = trove.chunk_status(&plan.plan_id).unwrap();
+        assert!(status.iter().all(|s| s.state == ChunkState::Untouched));
+
+        trove
+            .record_chunk_event(&plan.plan_id, &chunk_0, ChunkEventKind::Claimed, "machine-a")
+            .unwrap();
+        let status = trove.chunk_status(&plan.plan_id).unwrap();
+        let chunk_0_status = status.iter().find(|s| s.chunk_id == chunk_0).unwrap();
+        assert_eq!(chunk_0_status.state, ChunkState::Claimed);
+        let chunk_1_status = status.iter().find(|s| s.chunk_id == chunk_1).unwrap();
+        assert_eq!(chunk_1_status.state, ChunkState::Untouched);
+
+        trove
+            .record_chunk_event(
+                &plan.plan_id,
+                &chunk_0,
+                ChunkEventKind::Completed,
+                "machine-a",
+            )
+            .unwrap();
+        let status = trove.chunk_status(&plan.plan_id).unwrap();
+        let chunk_0_status = status.iter().find(|s| s.chunk_id == chunk_0).unwrap();
+        assert_eq!(chunk_0_status.state, ChunkState::Completed);
+        assert_eq!(chunk_0_status.claims.len(), 1);
+        assert_eq!(chunk_0_status.completions.len(), 1);
+
+        // A second, entirely independent Trove handle sharing the same
+        // underlying bucket (simulating a second machine) reconstructs the
+        // exact same status purely by pulling the plan and folding its
+        // event log -- no local state shared between the two handles at
+        // all, only the bucket.
+        let home2 = tempfile::tempdir().unwrap();
+        let trove2 = Trove::open_with_store(
+            config,
+            home2.path(),
+            Box::new(SharedStub(shared)),
+        )
+        .unwrap();
+        let status2 = trove2.chunk_status(&plan.plan_id).unwrap();
+        assert_eq!(status2, status);
+    }
+
+    #[test]
+    fn plan_and_event_round_trip_survives_a_real_filesystem_backed_bucket() {
+        // Every other Plan/event test uses StubStore's flat in-memory
+        // HashMap, which can't catch a bug specific to a real hierarchical
+        // store: the event key layout (`backfill-plans/<id>/events/<id>.json`)
+        // needs FsStore to actually create nested directories on `put`, and
+        // `list` to recurse into them. This is the same store a real "local"
+        // bucket (region = "local") uses.
+        use crate::library::{ChunkEventKind, ChunkState};
+        use crate::store::fs::FsStore;
+
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Artist")).unwrap();
+        std::fs::write(library.path().join("Artist/Track.mp3"), b"12345").unwrap();
+
+        let bucket_dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut trove = Trove::open_with_store(
+            test_config(),
+            home.path(),
+            Box::new(FsStore::new(bucket_dir.path().to_path_buf())),
+        )
+        .unwrap();
+
+        let plan = trove
+            .create_backfill_plan(library.path(), 1, &crate::library::ShapeOptions::default())
+            .unwrap();
+        assert_eq!(plan.chunks.len(), 1);
+        let chunk_id = plan.chunks[0].chunk_id.clone();
+
+        trove
+            .record_chunk_event(&plan.plan_id, &chunk_id, ChunkEventKind::Claimed, "laptop")
+            .unwrap();
+        trove
+            .record_chunk_event(&plan.plan_id, &chunk_id, ChunkEventKind::Completed, "laptop")
+            .unwrap();
+
+        // Actually landed as real, separate files under the expected
+        // nested path on disk, not just readable back through the trait.
+        let events_dir = bucket_dir
+            .path()
+            .join(".trove/backfill-plans")
+            .join(&plan.plan_id)
+            .join("events");
+        let files: Vec<_> = std::fs::read_dir(&events_dir).unwrap().collect();
+        assert_eq!(files.len(), 2, "each event is its own file under {events_dir:?}");
+
+        // A fresh Trove re-opened against the same on-disk bucket (no
+        // shared in-process state at all) reconstructs status purely by
+        // reading files back off disk.
+        let home2 = tempfile::tempdir().unwrap();
+        let trove2 = Trove::open_with_store(
+            test_config(),
+            home2.path(),
+            Box::new(FsStore::new(bucket_dir.path().to_path_buf())),
+        )
+        .unwrap();
+        let status = trove2.chunk_status(&plan.plan_id).unwrap();
+        assert_eq!(status[0].state, ChunkState::Completed);
+
+        // Listing plans still only sees the plan document itself, not the
+        // event files nested underneath it -- the exact bug this unit's
+        // BucketPaths/list_backfill_plans change guards against.
+        let plans = trove2.list_backfill_plans(None).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].plan_id, plan.plan_id);
+    }
+
+    #[test]
     fn backfill_slugs_gives_already_archived_content_a_slug_without_touching_bytes() {
         let library = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(library.path().join("Theo Parrish")).unwrap();

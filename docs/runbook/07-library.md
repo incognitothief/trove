@@ -2,9 +2,9 @@
 
 Manage the declared **library root** — the stable anchor cross-drive
 identity is computed relative to (ADR 007, Group D1). This is a growing
-command family: `root`, `backfill-slugs`, `shape`, and `plan` exist today;
-`plan status`/`plan claim` (ADR 007 Group E3/E3a) will live here too, once
-there's an event log to fold into per-chunk status.
+command family: `root`, `backfill-slugs`, `shape`, `plan create`, `plan
+list`, and `plan status` exist today; `plan claim` (ADR 007 Group E3a) will
+live here too, once there's a claim policy to wrap it in.
 
 ```bash
 bin/trove library root                                # show the current root
@@ -13,6 +13,7 @@ bin/trove library backfill-slugs                       # backfill existing entri
 bin/trove library shape [<path>]                        # inspect structure (defaults to the declared root)
 bin/trove library plan create [<path>]                  # push a new Backfill Plan
 bin/trove library plan list [--library-root <path>]     # list known plans
+bin/trove library plan status <plan-id>                 # per-chunk completed/claimed/untouched
 ```
 
 ## Why declare a library root at all
@@ -240,11 +241,42 @@ bin/trove --json library plan create /Volumes/T7/music/library
 }
 ```
 
-**Not yet implemented:** `plan status` (per-chunk completed/claimed/
-untouched, folded from an event log) and `plan claim` (claim a chunk and
-drive the ordinary `import plan/run/commit` pipeline against it) — these
-need the append-only event log (ADR 007, Group E3) this Plan document is
-designed to sit underneath, not yet built.
+## `trove library plan status`
+
+Per-chunk status, reconstructed by pulling a plan and folding its
+append-only event log (ADR 007, Group E3) — "what have I missed," even on
+a machine that's never touched this plan before.
+
+```bash
+bin/trove library plan status 8f14e45f-...
+```
+
+```text
+     0  completed     by laptop at 2026-08-16T12:04:00Z
+     1  claimed        by desktop at 2026-08-16T12:05:00Z
+     2  untouched
+```
+
+**Behavior:**
+
+- Every chunk is `completed` / `claimed` / `untouched`. `completed` wins
+  over `claimed` regardless of event ordering — a chunk with both a claim
+  and a completion event is `completed`.
+- Claiming is **non-exclusive**: nothing prevents (or dedupes) two machines
+  both claiming, or even both completing, the same chunk. That's wasteful,
+  not wrong — content-addressing and the slug+size fast path (D2/D3) make
+  redundant work cheap to absorb — so the event log records all of it
+  rather than silently collapsing it. `--json` output includes every claim
+  and completion event, not just the latest.
+- Needs a live bucket connection: this pulls the plan document and lists
+  its full event log.
+
+**Not yet implemented:** `plan claim` (pick a chunk per the pick-next
+policy, record a `claimed` event, drive the ordinary `import plan → run →
+commit` pipeline against it, then record `completed`) — that's ADR 007
+Group E3a, which wraps the event-recording primitives this unit added with
+an actual claim policy, on purpose not exposed as a bare "record an event"
+command here.
 
 ## See also
 

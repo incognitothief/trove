@@ -208,10 +208,20 @@ impl Trove {
         &self,
         library_root_filter: Option<&Path>,
     ) -> Result<Vec<crate::library::BackfillPlan>> {
-        let keys = self.store.list(&self.paths.backfill_plans_prefix())?;
+        let prefix = self.paths.backfill_plans_prefix();
+        let keys = self.store.list(&prefix)?;
         let mut plans = Vec::new();
         for key in keys {
-            if !key.ends_with(".json") {
+            // A plan document lives directly at `<prefix><plan_id>.json`; a
+            // chunk event lives one level deeper, under
+            // `<prefix><plan_id>/events/<event_id>.json` (Group E3). Both
+            // end in `.json`, so this must also check there's no further
+            // `/` after the prefix, or an event file would get misparsed as
+            // a plan document once any chunk has one.
+            let Some(rest) = key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if !rest.ends_with(".json") || rest.contains('/') {
                 continue;
             }
             let bytes = self.store.get(&key)?;
@@ -225,6 +235,57 @@ impl Trove {
         }
         plans.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         Ok(plans)
+    }
+
+    /// Fetch one Backfill Plan by id.
+    pub fn get_backfill_plan(&self, plan_id: &str) -> Result<crate::library::BackfillPlan> {
+        let bytes = self.store.get(&self.paths.backfill_plan(plan_id))?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Record one chunk-progress event (ADR 007, Group E3): a pure create
+    /// under a fresh, unique key, so this never races with another
+    /// machine's write the way a shared mutable document would — nothing
+    /// here needs the CAS retry loop `push_index` needs.
+    pub fn record_chunk_event(
+        &mut self,
+        plan_id: &str,
+        chunk_id: &str,
+        kind: crate::library::ChunkEventKind,
+        by: &str,
+    ) -> Result<crate::library::ChunkEvent> {
+        let event = crate::library::ChunkEvent {
+            event_id: uuid::Uuid::new_v4().to_string(),
+            chunk_id: chunk_id.to_string(),
+            kind,
+            by: by.to_string(),
+            at: Utc::now().to_rfc3339(),
+        };
+        let bytes = serde_json::to_vec_pretty(&event)?;
+        let key = self.paths.chunk_event(plan_id, &event.event_id);
+        match self.store.put_if_match(&key, None, &bytes)? {
+            PutOutcome::Written(_) => Ok(event),
+            PutOutcome::Conflict { .. } => Err(crate::error::Error::store(format!(
+                "chunk event {} already exists at {key} (event_id collision — this should be \
+                 practically impossible; retry)",
+                event.event_id
+            ))),
+        }
+    }
+
+    /// Pull a plan and its full event log, and fold them into current
+    /// per-chunk status — "what have I missed," reconstructable by any
+    /// machine, including one joining later, without hashing anything.
+    pub fn chunk_status(&self, plan_id: &str) -> Result<Vec<crate::library::ChunkStatus>> {
+        let plan = self.get_backfill_plan(plan_id)?;
+        let prefix = self.paths.chunk_events_prefix(plan_id);
+        let keys = self.store.list(&prefix)?;
+        let mut events = Vec::with_capacity(keys.len());
+        for key in keys {
+            let bytes = self.store.get(&key)?;
+            events.push(serde_json::from_slice(&bytes)?);
+        }
+        Ok(crate::library::fold_chunk_status(&plan, &events))
     }
 
     /// Reconcile, then check every indexed entry actually has a
