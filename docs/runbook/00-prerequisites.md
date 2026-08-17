@@ -23,7 +23,7 @@ build with S3 does not stick — prefix every real-bucket invocation:
 ```bash
 CARGO_FEATURES=s3 bin/trove archive pull-index
 CARGO_FEATURES=s3 bin/trove import ~/Music
-CARGO_FEATURES=s3 scripts/import-batch.sh ~/Music/DJ-Crates
+CARGO_FEATURES=s3 bin/trove library plan claim <plan-id>
 ```
 
 ## Invoke the CLI

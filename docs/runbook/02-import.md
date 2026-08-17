@@ -131,66 +131,65 @@ candidates.
 
 ## Batch import (multiple folders)
 
-Trove has no built-in globbing or batch import. For a tree of sibling folders
-(e.g. one crate per year under `~/Music/DJ-Crates/`), use the helper script:
+For a tree of sibling folders (e.g. one crate per year under
+`~/Music/DJ-Crates/`), use the [`library` command family](07-library.md)
+instead of running `import` by hand per folder. This replaced the old
+`scripts/import-batch.sh` wrapper (ADR 007, Group E5) — the same job, but
+durable, resumable without copy-pasting a folder path out of terminal
+output, and coordinated correctly across more than one machine working the
+same library.
 
 ```bash
-CARGO_FEATURES=s3 scripts/import-batch.sh ~/Music/DJ-Crates
+bin/trove library root --set ~/Music/DJ-Crates      # 1. declare the root
+bin/trove library shape                              # 2. see real structure/size first
+bin/trove library plan create                         # 3. push a durable chunk plan
+bin/trove library plan claim <plan-id>                 # 4. claim + import chunks, repeatedly
 ```
 
-For a local filesystem bucket (`region = "local"`), omit `CARGO_FEATURES=s3`.
-
-The script runs one **one-shot** import per **immediate subdirectory** (not
-recursive). Each folder gets the full `scan → upload → verify → commit` cycle.
-Progress prints as `[N/total] importing …`; failures are logged and the script
-continues with the remaining folders.
-
-Forward import flags to every invocation:
+Each `plan claim` runs one ordinary `scan → upload → verify → commit` cycle
+per chunk (by default, one immediate subdirectory) and picks the next
+untouched chunk automatically — just keep re-running it:
 
 ```bash
-scripts/import-batch.sh ~/Music/DJ-Crates -- --no-artwork
+bin/trove library plan claim <plan-id>
+bin/trove library plan claim <plan-id>
+# ... repeat until it refuses with "no untouched chunks remain"
 ```
 
-Exit code is the number of failed folders (0 when all succeed). Folders are
-processed in C locale sort order (byte-wise, usually alphabetical).
+Forward import flags the same way `import` accepts them:
+
+```bash
+bin/trove library plan claim <plan-id> --no-artwork
+```
 
 ### Resume a batch run
 
-Two cases:
-
-**1. A folder finished cleanly; you want the next folder onward**
-
-Use `--after` with the **full path** to the last folder that completed. Copy it
-from the `[N/total] importing …` line in your terminal output:
+No folder paths to copy-paste — pull status and let pick-next handle it:
 
 ```bash
-CARGO_FEATURES=s3 scripts/import-batch.sh \
-  --after "/Volumes/T72/music/library/1600J" \
-  /Volumes/T72/music/library
+bin/trove library plan status <plan-id>
+# → per-chunk completed / claimed / untouched
+
+bin/trove library plan claim <plan-id>
+# → automatically picks the next untouched chunk
 ```
 
-**2. A folder died mid-import (Ctrl-C, crash, error)**
-
-Finish that folder's job first, then continue the batch:
+A chunk that died mid-import (Ctrl-C, crash, error) never got a `completed`
+event, so it's still `claimed` in `plan status` — a stale-claim hint, not a
+lock. Re-run it explicitly by chunk id, or opt into picking it up
+automatically:
 
 ```bash
-CARGO_FEATURES=s3 bin/trove import list
-CARGO_FEATURES=s3 bin/trove import status <job-id>
-CARGO_FEATURES=s3 bin/trove import resume <job-id>
-CARGO_FEATURES=s3 bin/trove import commit <job-id>
+bin/trove library plan claim <plan-id> <chunk-id>     # a specific chunk
+bin/trove library plan claim <plan-id> --include-claimed  # first non-completed chunk
 ```
 
-Then either `--after` that folder, or `--from` the folder that failed if you
-want to re-run it from scratch:
-
-```bash
-CARGO_FEATURES=s3 scripts/import-batch.sh \
-  --after "/Volumes/T72/music/library/Broken Artist" \
-  /Volumes/T72/music/library
-```
-
-Re-running folders that already committed is safe (files show as `duplicate`)
-but wastes time — prefer `--after` when you know the last success.
+Re-running a chunk that already committed is safe and cheap — the
+slug+size fast path (D3) recognizes already-archived content without a
+full re-hash, so redundant work doesn't cost much. See the
+[Library runbook](07-library.md) for the full command family, including
+`--chunk-folders` (group more than one subdirectory per chunk) and the
+chunk-level stat sanity check.
 
 For a single deep tree, import the parent path directly instead:
 
@@ -277,7 +276,7 @@ Progress events are suppressed in `--json` mode (no stderr progress lines).
 
 | Topic | Status |
 | --- | --- |
-| Glob / native batch import | Use `scripts/import-batch.sh` for sibling folders |
+| Glob / native batch import | Use `library plan create` + `library plan claim` for sibling folders — see [Batch import](#batch-import-multiple-folders) above |
 | Rich metadata (artist, album, BPM) | `StubExtractor` — title from filename only |
 | Mid-file multipart resume | Whole file re-uploaded on retry |
 | Import manifest in bucket | Local `~/.trove/cache/manifests/` only |
