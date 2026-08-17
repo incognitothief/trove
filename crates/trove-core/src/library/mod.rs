@@ -8,6 +8,7 @@ pub mod backfill;
 pub mod claim;
 pub mod events;
 pub mod plan;
+pub mod sanity;
 pub mod shape;
 pub mod slug;
 
@@ -15,5 +16,6 @@ pub use backfill::{plan_slug_backfill, BackfillSlugsReport};
 pub use claim::{pick_next_chunk, resolve_chunk_targets, ClaimReport, PickNextError};
 pub use events::{fold_chunk_status, ChunkEvent, ChunkEventKind, ChunkState, ChunkStatus};
 pub use plan::{build_plan, BackfillPlan, PlanChunk};
+pub use sanity::{check_chunk_stats, StatSanityCheck};
 pub use shape::{scan_library_shape, LibraryShape, ShapeOptions, SubtreeShape};
 pub use slug::compute_slug;

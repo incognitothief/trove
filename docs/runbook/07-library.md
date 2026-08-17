@@ -328,6 +328,19 @@ bin/trove library plan claim 8f14e45f-... --include-claimed
   — this really is the same pipeline.
 - `--by <name>` labels who's claiming (defaults to `$USER`). Purely
   informational — never used to grant or deny a claim.
+- **Stat sanity check (ADR 007, Group E4):** compares what was actually
+  scanned against the shape scan's original estimate for this chunk. A
+  mismatch (file count or byte total off by 2x or more in either direction)
+  prints a warning but **never blocks the claim** — it's a coarse hint that
+  a folder's contents may not be what was originally scoped (the one real
+  risk case: a same-named folder with unrelated content underneath, e.g.
+  after a drive swap), not a correctness check.
+
+```text
+claimed chunk 0 of plan ea835505-...: 11 track(s) committed across 1 target(s)
+  /Volumes/T7/music/library/Artist
+  warning: stat sanity check mismatch — expected ~1 audio file(s) (7 B), actually scanned 11 (588 B). Not a failure — a folder's contents may have changed since this plan was created.
+```
 
 ### JSON output
 
@@ -340,7 +353,14 @@ bin/trove --json library plan claim 8f14e45f-...
   "plan_id": "8f14e45f-...",
   "chunk_id": "3",
   "targets": ["/Volumes/T7/music/library/Kyle Hall"],
-  "tracks_committed": 212
+  "tracks_committed": 212,
+  "stat_check": {
+    "estimated_audio_file_count": 212,
+    "estimated_audio_bytes": 7301234567,
+    "actual_audio_file_count": 212,
+    "actual_audio_bytes": 7301234567,
+    "mismatch": false
+  }
 }
 ```
 

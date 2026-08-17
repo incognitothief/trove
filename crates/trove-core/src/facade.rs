@@ -362,10 +362,26 @@ impl Trove {
         self.record_chunk_event(plan_id, &chosen_id, crate::library::ChunkEventKind::Claimed, by)?;
 
         let mut tracks_committed = 0u64;
+        let mut actual_audio_file_count = 0u64;
+        let mut actual_audio_bytes = 0u64;
         for target in &targets {
-            let (_, committed) = self.import_run_full(target, options, allow_offline, progress)?;
+            let (job, committed) = self.import_run_full(target, options, allow_offline, progress)?;
             tracks_committed += committed as u64;
+            // Every scanned audio file, not just newly-committed ones (a
+            // duplicate is still real content the shape scan would have
+            // seen) -- this is a check on "does this folder's actual audio
+            // content match what was scoped," not on transfer success,
+            // which `committed`/verify already cover elsewhere (ADR 007,
+            // Group E4).
+            actual_audio_file_count += job.files.len() as u64;
+            actual_audio_bytes += job.files.iter().map(|f| f.size).sum::<u64>();
         }
+        let stat_check = crate::library::check_chunk_stats(
+            chunk.estimated_audio_file_count,
+            chunk.estimated_audio_bytes,
+            actual_audio_file_count,
+            actual_audio_bytes,
+        );
 
         self.record_chunk_event(plan_id, &chosen_id, crate::library::ChunkEventKind::Completed, by)?;
 
@@ -374,6 +390,7 @@ impl Trove {
             chunk_id: chosen_id,
             targets,
             tracks_committed,
+            stat_check,
         })
     }
 

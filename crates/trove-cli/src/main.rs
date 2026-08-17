@@ -557,6 +557,17 @@ fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
                 for target in &report.targets {
                     println!("  {}", target.display());
                 }
+                if report.stat_check.mismatch {
+                    println!(
+                        "  warning: stat sanity check mismatch — expected ~{} audio file(s) \
+                         ({}), actually scanned {} ({}). Not a failure — a folder's contents \
+                         may have changed since this plan was created.",
+                        report.stat_check.estimated_audio_file_count,
+                        format_bytes(report.stat_check.estimated_audio_bytes),
+                        report.stat_check.actual_audio_file_count,
+                        format_bytes(report.stat_check.actual_audio_bytes),
+                    );
+                }
             }
         }
     }

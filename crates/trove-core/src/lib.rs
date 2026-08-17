@@ -851,6 +851,58 @@ mod tests {
     }
 
     #[test]
+    fn claim_flags_a_stat_mismatch_when_a_folder_changed_after_the_plan_was_made_but_still_completes(
+    ) {
+        // The one real risk case Group E4 exists for: a folder name collides
+        // with genuinely different content underneath by the time it's
+        // actually claimed. This must surface as a hint, not block the claim.
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Artist")).unwrap();
+        std::fs::write(library.path().join("Artist/Track1.mp3"), b"12345").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let mut trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+        let plan = trove
+            .create_backfill_plan(library.path(), 1, &crate::library::ShapeOptions::default())
+            .unwrap();
+        assert_eq!(plan.chunks[0].estimated_audio_file_count, 1);
+
+        // Between plan creation and claim, this folder gained a lot more
+        // content than the shape scan originally saw.
+        for i in 0..10 {
+            std::fs::write(
+                library.path().join(format!("Artist/Extra{i}.mp3")),
+                b"unexpected extra content that was not there when planned",
+            )
+            .unwrap();
+        }
+
+        let mut progress = NoopImportProgress;
+        let report = trove
+            .claim_backfill_chunk(
+                &plan.plan_id,
+                None,
+                false,
+                "machine-a",
+                false,
+                &ImportOptions::default(),
+                &mut progress,
+            )
+            .unwrap();
+
+        assert!(report.stat_check.mismatch, "11 actual files vs. 1 estimated must flag");
+        assert_eq!(report.stat_check.estimated_audio_file_count, 1);
+        assert_eq!(report.stat_check.actual_audio_file_count, 11);
+
+        // A mismatch is a hint, not a correctness boundary -- the claim
+        // must still have completed normally.
+        let status = trove.chunk_status(&plan.plan_id).unwrap();
+        assert_eq!(status[0].state, crate::library::ChunkState::Completed);
+    }
+
+    #[test]
     fn backfill_slugs_gives_already_archived_content_a_slug_without_touching_bytes() {
         let library = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(library.path().join("Theo Parrish")).unwrap();

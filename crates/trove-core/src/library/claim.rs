@@ -21,6 +21,10 @@ pub struct ClaimReport {
     /// ordinary `import plan → run → commit` job each.
     pub targets: Vec<PathBuf>,
     pub tracks_committed: u64,
+    /// Chunk-level stat sanity check (ADR 007, Group E4): the shape scan's
+    /// estimate for this chunk vs. what was actually scanned just now. A
+    /// hint, never a reason this claim itself failed.
+    pub stat_check: crate::library::StatSanityCheck,
 }
 
 /// Why `pick_next_chunk` couldn't resolve a chunk to claim.
