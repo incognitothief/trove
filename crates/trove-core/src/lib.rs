@@ -733,6 +733,124 @@ mod tests {
     }
 
     #[test]
+    fn claim_picks_the_next_untouched_chunk_and_actually_imports_it() {
+        use crate::library::ChunkState;
+
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Artist A")).unwrap();
+        std::fs::create_dir_all(library.path().join("Artist B")).unwrap();
+        std::fs::write(library.path().join("Artist A/Track1.mp3"), b"12345").unwrap();
+        std::fs::write(library.path().join("Artist B/Track2.mp3"), b"123").unwrap();
+        std::fs::write(library.path().join("Loose.mp3"), b"loose").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let mut trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+        let plan = trove
+            .create_backfill_plan(library.path(), 1, &crate::library::ShapeOptions::default())
+            .unwrap();
+        assert_eq!(plan.chunks.len(), 2);
+        let chunk_0 = plan.chunks[0].chunk_id.clone(); // Artist A + loose root files
+        let chunk_1 = plan.chunks[1].chunk_id.clone(); // Artist B
+
+        let mut progress = NoopImportProgress;
+
+        // No explicit chunk id -- pick-next must land on the first
+        // untouched chunk in plan order, which also covers the loose file.
+        let report = trove
+            .claim_backfill_chunk(
+                &plan.plan_id,
+                None,
+                false,
+                "machine-a",
+                false,
+                &ImportOptions::default(),
+                &mut progress,
+            )
+            .unwrap();
+        assert_eq!(report.chunk_id, chunk_0);
+        assert_eq!(report.targets.len(), 2, "Artist A folder + Loose.mp3");
+        assert_eq!(report.tracks_committed, 2);
+
+        let status = trove.chunk_status(&plan.plan_id).unwrap();
+        let s0 = status.iter().find(|s| s.chunk_id == chunk_0).unwrap();
+        assert_eq!(s0.state, ChunkState::Completed);
+        let s1 = status.iter().find(|s| s.chunk_id == chunk_1).unwrap();
+        assert_eq!(s1.state, ChunkState::Untouched);
+
+        // The actual archive now has both tracks from chunk 0's targets.
+        let entries = trove.query(&QuerySpec::new(), false).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        // Claiming again with no explicit id must move on to chunk 1, not
+        // redo chunk 0 -- chunk 0 is no longer "untouched".
+        let report2 = trove
+            .claim_backfill_chunk(
+                &plan.plan_id,
+                None,
+                false,
+                "machine-a",
+                false,
+                &ImportOptions::default(),
+                &mut progress,
+            )
+            .unwrap();
+        assert_eq!(report2.chunk_id, chunk_1);
+
+        // Now every chunk is completed -- a third claim with no explicit id
+        // must refuse rather than silently redoing work.
+        let err = trove
+            .claim_backfill_chunk(
+                &plan.plan_id,
+                None,
+                false,
+                "machine-a",
+                false,
+                &ImportOptions::default(),
+                &mut progress,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("no untouched chunks remain"));
+    }
+
+    #[test]
+    fn claim_with_an_unknown_explicit_chunk_id_refuses_with_a_clear_error() {
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Artist")).unwrap();
+        std::fs::write(library.path().join("Artist/Track.mp3"), b"12345").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let mut trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+        let plan = trove
+            .create_backfill_plan(library.path(), 1, &crate::library::ShapeOptions::default())
+            .unwrap();
+        let mut progress = NoopImportProgress;
+
+        let err = trove
+            .claim_backfill_chunk(
+                &plan.plan_id,
+                Some("does-not-exist"),
+                false,
+                "machine-a",
+                false,
+                &ImportOptions::default(),
+                &mut progress,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("does-not-exist"));
+
+        // Refusing to pick a chunk must not have left any stray claim event
+        // behind for a chunk that was never actually chosen.
+        let status = trove.chunk_status(&plan.plan_id).unwrap();
+        assert!(status
+            .iter()
+            .all(|s| s.state == crate::library::ChunkState::Untouched));
+    }
+
+    #[test]
     fn backfill_slugs_gives_already_archived_content_a_slug_without_touching_bytes() {
         let library = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(library.path().join("Theo Parrish")).unwrap();

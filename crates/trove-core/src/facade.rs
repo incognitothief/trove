@@ -288,6 +288,95 @@ impl Trove {
         Ok(crate::library::fold_chunk_status(&plan, &events))
     }
 
+    /// Claim a chunk of a Backfill Plan and drive it to completion (ADR
+    /// 007, Group E3a): pick a chunk (explicit `chunk_id`, or the
+    /// pick-next policy — see [`crate::library::pick_next_chunk`]), record
+    /// a `claimed` event, run the *ordinary* `import plan → run → commit`
+    /// pipeline against each of the chunk's resolved folders in turn — this
+    /// is not new or separate machinery, it's the existing pipeline just
+    /// pointed at a folder the Plan chose — then record `completed` only
+    /// if every target succeeded.
+    ///
+    /// `by` is a free-form, purely informational identifier for whoever's
+    /// claiming (hostname, an operator label); it never grants or denies
+    /// anything. Claiming is non-exclusive by design: nothing here checks
+    /// whether another machine already claimed the same chunk unless the
+    /// caller opted into that via `include_claimed` at pick-next time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_backfill_chunk(
+        &mut self,
+        plan_id: &str,
+        chunk_id: Option<&str>,
+        include_claimed: bool,
+        by: &str,
+        allow_offline: bool,
+        options: &ImportOptions,
+        progress: &mut dyn ImportProgress,
+    ) -> Result<crate::library::ClaimReport> {
+        let plan = self.get_backfill_plan(plan_id)?;
+        let statuses = self.chunk_status(plan_id)?;
+        let chosen_id = crate::library::pick_next_chunk(&plan, &statuses, chunk_id, include_claimed)
+            .map_err(|err| {
+                use crate::library::PickNextError;
+                crate::error::Error::config(match err {
+                    PickNextError::UnknownChunkId(id) => {
+                        format!("plan {plan_id} has no chunk {id}")
+                    }
+                    PickNextError::NoUntouchedChunksRemain => {
+                        "no untouched chunks remain in this plan — pass an explicit chunk id, \
+                         or --include-claimed to pick up a possibly-still-in-progress chunk"
+                            .to_string()
+                    }
+                    PickNextError::AllChunksCompleted => {
+                        "every chunk in this plan is already completed".to_string()
+                    }
+                })
+            })?;
+        let chunk = plan
+            .chunks
+            .iter()
+            .find(|c| c.chunk_id == chosen_id)
+            .expect("pick_next_chunk only ever returns a chunk_id present in the plan")
+            .clone();
+
+        // The shape scan that produced the plan only recorded aggregate
+        // stats for loose root files, not their individual paths (Group
+        // E1) — re-discover them now with the same filter `import` itself
+        // uses, rather than persisting a second copy of a file listing that
+        // could go stale between plan creation and claim.
+        let loose_root_files = if chunk.includes_root_files {
+            let mut files = Vec::new();
+            for entry in std::fs::read_dir(&plan.library_root)? {
+                let path = entry?.path();
+                if path.is_file() && !crate::import::is_hidden(&path, options.include_dotfiles) {
+                    files.push(path);
+                }
+            }
+            files.sort();
+            files
+        } else {
+            Vec::new()
+        };
+        let targets = crate::library::resolve_chunk_targets(&plan.library_root, &chunk, &loose_root_files);
+
+        self.record_chunk_event(plan_id, &chosen_id, crate::library::ChunkEventKind::Claimed, by)?;
+
+        let mut tracks_committed = 0u64;
+        for target in &targets {
+            let (_, committed) = self.import_run_full(target, options, allow_offline, progress)?;
+            tracks_committed += committed as u64;
+        }
+
+        self.record_chunk_event(plan_id, &chosen_id, crate::library::ChunkEventKind::Completed, by)?;
+
+        Ok(crate::library::ClaimReport {
+            plan_id: plan_id.to_string(),
+            chunk_id: chosen_id,
+            targets,
+            tracks_committed,
+        })
+    }
+
     /// Reconcile, then check every indexed entry actually has a
     /// correctly-sized object in the bucket. `deep` re-downloads and
     /// re-hashes every object instead of only checking presence/size — a

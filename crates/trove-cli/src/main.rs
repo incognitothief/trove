@@ -116,6 +116,28 @@ enum PlanCmd {
     /// any machine, including one joining later — this is "what have I
     /// missed."
     Status { plan_id: String },
+    /// Claim a chunk and drive it through the ordinary `import plan → run →
+    /// commit` pipeline (ADR 007, Group E3a). With no chunk id, picks the
+    /// next untouched chunk in plan order; refuses if none remain unless
+    /// `--include-claimed` opts into picking up a possibly-still-in-progress
+    /// one. Claiming is non-exclusive — nothing here steals another
+    /// machine's claim or blocks on it.
+    Claim {
+        plan_id: String,
+        /// Claim this specific chunk instead of using the pick-next policy.
+        chunk_id: Option<String>,
+        /// Fall back to the first not-yet-completed chunk if nothing is
+        /// untouched, instead of refusing. Only takes effect with no
+        /// explicit chunk id.
+        #[arg(long)]
+        include_claimed: bool,
+        /// Free-form, purely informational label for who's claiming this
+        /// (defaults to $USER).
+        #[arg(long)]
+        by: Option<String>,
+        #[command(flatten)]
+        options: ImportOptionsArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -484,6 +506,56 @@ fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
                         chunk_state_str(status.state),
                         detail
                     );
+                }
+            }
+        }
+        LibraryCmd::Plan(PlanCmd::Claim {
+            plan_id,
+            chunk_id,
+            include_claimed,
+            by,
+            options,
+        }) => {
+            let mut trove = runtime::open_trove()?;
+            let opts = merge_import_options(&trove, options);
+            let by = by.clone().unwrap_or_else(|| {
+                std::env::var("USER")
+                    .or_else(|_| std::env::var("USERNAME"))
+                    .unwrap_or_else(|_| "unknown".to_string())
+            });
+            let mut cli_progress = import_progress::CliImportProgress::new();
+            let mut noop = trove_core::NoopImportProgress;
+            let progress: &mut dyn trove_core::import::ImportProgress = if cli.json {
+                &mut noop
+            } else {
+                &mut cli_progress
+            };
+            let report = trove
+                .claim_backfill_chunk(
+                    plan_id,
+                    chunk_id.as_deref(),
+                    *include_claimed,
+                    &by,
+                    cli.offline,
+                    &opts,
+                    progress,
+                )
+                .with_context(|| format!("claiming a chunk of plan {plan_id}"))?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("serialize claim report")
+                );
+            } else {
+                println!(
+                    "claimed chunk {} of plan {}: {} track(s) committed across {} target(s)",
+                    report.chunk_id,
+                    report.plan_id,
+                    report.tracks_committed,
+                    report.targets.len(),
+                );
+                for target in &report.targets {
+                    println!("  {}", target.display());
                 }
             }
         }

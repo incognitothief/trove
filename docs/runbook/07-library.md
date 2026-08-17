@@ -1,10 +1,7 @@
 # Library runbook
 
 Manage the declared **library root** — the stable anchor cross-drive
-identity is computed relative to (ADR 007, Group D1). This is a growing
-command family: `root`, `backfill-slugs`, `shape`, `plan create`, `plan
-list`, and `plan status` exist today; `plan claim` (ADR 007 Group E3a) will
-live here too, once there's a claim policy to wrap it in.
+identity is computed relative to (ADR 007, Group D1). Full command family:
 
 ```bash
 bin/trove library root                                # show the current root
@@ -14,6 +11,7 @@ bin/trove library shape [<path>]                        # inspect structure (def
 bin/trove library plan create [<path>]                  # push a new Backfill Plan
 bin/trove library plan list [--library-root <path>]     # list known plans
 bin/trove library plan status <plan-id>                 # per-chunk completed/claimed/untouched
+bin/trove library plan claim <plan-id> [<chunk-id>]     # claim a chunk and actually import it
 ```
 
 ## Why declare a library root at all
@@ -271,12 +269,80 @@ bin/trove library plan status 8f14e45f-...
 - Needs a live bucket connection: this pulls the plan document and lists
   its full event log.
 
-**Not yet implemented:** `plan claim` (pick a chunk per the pick-next
-policy, record a `claimed` event, drive the ordinary `import plan → run →
-commit` pipeline against it, then record `completed`) — that's ADR 007
-Group E3a, which wraps the event-recording primitives this unit added with
-an actual claim policy, on purpose not exposed as a bare "record an event"
-command here.
+## `trove library plan claim`
+
+Claim a chunk and actually drive it through the ordinary import pipeline —
+`import plan → run → commit` — against its resolved folder(s) (ADR 007,
+Group E3a). This is the "do the backfill" command; everything above this
+point in the family is inspection and coordination bookkeeping around it.
+
+```bash
+bin/trove library plan claim 8f14e45f-...
+```
+
+```text
+claimed chunk 3 of plan 8f14e45f-...: 212 track(s) committed across 1 target(s)
+  /Volumes/T7/music/library/Kyle Hall
+```
+
+With no chunk id, picks the next chunk per the **pick-next rule**: prefer a
+chunk with no events at all yet, in the plan's own order (the shape scan's
+alphabetical folder order). If nothing is untouched, `claim` refuses:
+
+```text
+error: claiming a chunk of plan 8f14e45f-...: configuration error: no untouched chunks remain in this plan — pass an explicit chunk id, or --include-claimed to pick up a possibly-still-in-progress chunk
+```
+
+Claim a specific chunk directly (bypasses the pick-next rule entirely):
+
+```bash
+bin/trove library plan claim 8f14e45f-... 3
+```
+
+Recover a stale claim (a machine died mid-chunk and never completed it) —
+without an explicit chunk id, this needs an opt-in, so "no steal" stays the
+real default:
+
+```bash
+bin/trove library plan claim 8f14e45f-... --include-claimed
+```
+
+**Requirements and behavior:**
+
+- Needs a live bucket connection — this reads the plan and event log, and
+  actually runs import jobs against the resolved folder(s).
+- **Non-exclusive by design.** Nothing here checks whether another machine
+  already claimed or even completed the same chunk (unless you opt in via
+  `--include-claimed`). Two machines redundantly working the same chunk is
+  wasteful, not wrong — content-addressing and the slug+size fast path
+  (D2/D3) make the redundant upload/hash work cheap to absorb rather than
+  something that needs preventing.
+- A chunk covering more than one folder (`--chunk-folders N > 1`) or the
+  library's loose root files runs one ordinary import job per target, in
+  sequence, under a single claim/completion pair for the whole chunk.
+- `completed` is only recorded if every target in the chunk succeeds. A
+  failure partway through leaves the earlier `claimed` event standing as a
+  stale-claim hint — safe to retry with `--include-claimed` or an explicit
+  chunk id later.
+- Accepts `--include-dotfiles`/`--no-artwork`/`--artwork`, same as `import`
+  — this really is the same pipeline.
+- `--by <name>` labels who's claiming (defaults to `$USER`). Purely
+  informational — never used to grant or deny a claim.
+
+### JSON output
+
+```bash
+bin/trove --json library plan claim 8f14e45f-...
+```
+
+```json
+{
+  "plan_id": "8f14e45f-...",
+  "chunk_id": "3",
+  "targets": ["/Volumes/T7/music/library/Kyle Hall"],
+  "tracks_committed": 212
+}
+```
 
 ## See also
 
