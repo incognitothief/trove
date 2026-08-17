@@ -444,6 +444,7 @@ impl Trove {
             Some(&self.archive),
             Some(&self.import_db),
             Some(&self.fingerprint_cache),
+            self.library_root(),
             None,
             progress,
         )?;
@@ -474,6 +475,7 @@ impl Trove {
             Some(&self.archive),
             Some(&self.import_db),
             Some(&self.fingerprint_cache),
+            self.library_root(),
             Some(job_id),
             progress,
         )?;

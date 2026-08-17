@@ -7,7 +7,7 @@ Backfill audio from a local folder into the durable archive. Import is
 Pipeline per file:
 
 ```text
-scan → fingerprint (SHA-256) → dedupe → upload (staging) → verify → commit (music/) → push index
+scan → slug+size fast path → fingerprint cache → fingerprint (SHA-256) → dedupe → upload (staging) → verify → commit (music/) → push index
 ```
 
 State is persisted in `~/.trove/sync.sqlite`. Job ids are UUIDs printed during
@@ -33,6 +33,32 @@ job; this one helps across completely separate `trove import` invocations,
 which is the common case for a repeat backfill or re-scanning the same
 drive. Purely a performance cache — deleting it is always safe, just costs a
 future re-hash.
+
+If a [library root](07-library.md) is declared, `plan` checks it *before*
+the fingerprint cache: a file whose path (relative to the root) and size
+match an already-archived entry is marked `duplicate` without reading the
+file at all — not even a cache lookup. This is what makes re-pointing
+import at a cloned or replacement drive (same relative layout, different
+mount point) cheap instead of a full re-hash of the whole library. Plan
+output labels *why* a file was recognized as a duplicate:
+
+```text
+  duplicate  /Volumes/T72/Artist/Track.mp3  (slug+size, not re-hashed)
+```
+
+versus a file whose bytes were actually read and hashed against the
+archive:
+
+```text
+  duplicate  /Volumes/T72/Artist/Other.mp3  (hash-confirmed)
+```
+
+`--json` plan output carries the same distinction as a `duplicate_reason`
+field (`"slug+size, not re-hashed"`, `"hash-confirmed"`, or `null` for a
+duplicate within the same scan that isn't archived yet). A slug match with
+a *different* size is never trusted — that's treated as a genuine
+replacement file at the same catalog position, not a duplicate, and falls
+through to a real hash.
 
 ## Command reference
 

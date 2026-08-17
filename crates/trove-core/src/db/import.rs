@@ -442,6 +442,9 @@ fn row_to_planned_file(r: &Row<'_>) -> rusqlite::Result<PlannedFile> {
         etag,
         error,
         attempts: attempts as u32,
+        // Transient scan-time-only information (ADR 007, Group D3) — not
+        // persisted, so a reload from the DB always starts unlabeled.
+        duplicate_reason: None,
     })
 }
 

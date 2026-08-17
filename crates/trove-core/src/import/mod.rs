@@ -52,6 +52,31 @@ impl Default for ImportOptions {
     }
 }
 
+/// How a `Duplicate` file was determined — surfaced in `plan` output so a
+/// trusted-but-unverified match is never silently indistinguishable from an
+/// actually-confirmed one (ADR 007, Group D3; matches this project's
+/// convention of surfacing gaps honestly rather than faking success).
+/// Transient scan-time information only — not persisted across a job
+/// reload, since by then the distinction is no longer the operator's
+/// immediate concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateReason {
+    /// Matched an existing archive entry by library-relative-path slug and
+    /// file size — the bytes themselves were never read or hashed.
+    SlugAndSize,
+    /// Matched an existing archive entry by full SHA-256 content hash.
+    ContentHash,
+}
+
+impl DuplicateReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DuplicateReason::SlugAndSize => "slug+size, not re-hashed",
+            DuplicateReason::ContentHash => "hash-confirmed",
+        }
+    }
+}
+
 /// A single file discovered during scan, carrying its explicit state.
 #[derive(Debug, Clone)]
 pub struct PlannedFile {
@@ -65,6 +90,7 @@ pub struct PlannedFile {
     pub etag: Option<String>,
     pub error: Option<String>,
     pub attempts: u32,
+    pub duplicate_reason: Option<DuplicateReason>,
 }
 
 /// A cover-art image found next to imported audio, captured for durability.
@@ -153,10 +179,22 @@ const MAX_STORE_ATTEMPTS: u32 = 5;
 /// unchanged path — the common case for a repeat backfill or a re-run against
 /// the same drive — skips the read+hash entirely instead of paying full price
 /// every time (ADR 007, Group C1).
-// Eight params, all but the first three optional context (archive/db/cache)
-// or resume state — bundling them into a struct would touch every call site
-// for no clarity gain over the existing `Option<&T>` pattern already used
-// throughout this module.
+///
+/// `library_root`, when provided, is checked *before* `fingerprint_cache`:
+/// a file whose library-relative-path slug and on-disk size both match an
+/// existing archive entry is a full skip — no read, no hash, not even a
+/// fingerprint-cache lookup — the whole reason this exists is to make a
+/// cross-drive rescan (a replacement drive, an `rsync` clone) cheap, and the
+/// slug is the only signal that can recognize that case at all (unlike
+/// `fingerprint_cache`, which is keyed by the *same* path). If the slug
+/// matches but the size doesn't, this deliberately falls through to a real
+/// hash rather than guessing — the coarse filter's job is to flag "needs a
+/// closer look," never to make the final call on an ambiguous case (ADR 007,
+/// Group D3).
+// Nine params, all but the first three optional context (archive/db/cache/
+// root) or resume state — bundling them into a struct would touch every
+// call site for no clarity gain over the existing `Option<&T>` pattern
+// already used throughout this module.
 #[allow(clippy::too_many_arguments)]
 pub fn plan(
     source_root: &Path,
@@ -165,6 +203,7 @@ pub fn plan(
     archive: Option<&ArchiveDb>,
     db: Option<&ImportDb>,
     fingerprint_cache: Option<&FingerprintCache>,
+    library_root: Option<&Path>,
     resume_job_id: Option<&str>,
     progress: &mut dyn ImportProgress,
 ) -> Result<ImportJob> {
@@ -243,6 +282,7 @@ pub fn plan(
                 etag: None,
                 error: None,
                 attempts: 0,
+                duplicate_reason: None,
             }
         };
 
@@ -253,6 +293,31 @@ pub fn plan(
         let meta = std::fs::metadata(path)?;
         file.size = meta.len();
         file.mtime = file_mtime_from_meta(&meta);
+
+        // D3: slug + size fast path, checked *before* the fingerprint cache
+        // (see this function's doc comment for why). A match here means the
+        // file's bytes are never read or hashed at all.
+        let slug_match = library_root.zip(archive).and_then(|(root, archive_db)| {
+            let slug = crate::library::compute_slug(root, path)?;
+            archive_db
+                .find_by_relative_path(&slug)
+                .ok()?
+                .into_iter()
+                .find(|candidate| candidate.size_bytes == file.size)
+        });
+        if let Some(existing) = slug_match {
+            file.sha256 = existing.sha256.clone();
+            file.object_key = Some(existing.object_key.clone());
+            file.track_id = Some(existing.track_id.clone());
+            file.state = FileState::Duplicate;
+            file.duplicate_reason = Some(DuplicateReason::SlugAndSize);
+            file.error = None;
+            persist_file(db, &id, &file)?;
+            done += 1;
+            progress.file_done(Phase::Fingerprint, done, total, path, file.state);
+            files.push(file);
+            continue;
+        }
 
         let cached_sha = fingerprint_cache
             .and_then(|cache| cache.lookup(path, file.size, file.mtime.as_deref()).ok())
@@ -270,15 +335,28 @@ pub fn plan(
                 sha
             }
         };
+        // `seen_hashes.insert` must run for every file regardless of the
+        // outcome below (so later files in this same scan can detect a
+        // collision against this one too) — bind it once rather than relying
+        // on `||` short-circuiting, since `already_in_archive` isn't free.
+        let new_in_this_scan = seen_hashes.insert(file.sha256.clone());
         let already_in_archive = match archive {
             Some(db) => db.find_by_sha256(&file.sha256)?.is_some(),
             None => false,
         };
-        file.state = if !seen_hashes.insert(file.sha256.clone()) || already_in_archive {
-            FileState::Duplicate
+        if already_in_archive {
+            file.state = FileState::Duplicate;
+            file.duplicate_reason = Some(DuplicateReason::ContentHash);
+        } else if !new_in_this_scan {
+            // A duplicate of another file *within this same scan*, not a
+            // match against the archive — a different thing than either
+            // duplicate_reason variant describes, so this stays unlabeled.
+            file.state = FileState::Duplicate;
+            file.duplicate_reason = None;
         } else {
-            FileState::Hashed
-        };
+            file.state = FileState::Hashed;
+            file.duplicate_reason = None;
+        }
         file.error = None;
         persist_file(db, &id, &file)?;
 
@@ -1000,6 +1078,7 @@ mod tests {
                     etag: None,
                     error: Some("timeout".into()),
                     attempts: 2,
+                    duplicate_reason: None,
                 },
                 PlannedFile {
                     path: PathBuf::from("/src/b.mp3"),
@@ -1012,6 +1091,7 @@ mod tests {
                     etag: None,
                     error: None,
                     attempts: 0,
+                    duplicate_reason: None,
                 },
             ],
             artwork: Vec::new(),

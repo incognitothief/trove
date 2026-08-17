@@ -559,6 +559,7 @@ fn print_planned_job(job: &trove_core::import::ImportJob, json: bool) {
                     "path": f.path,
                     "state": f.state.as_str(),
                     "sha256": f.sha256,
+                    "duplicate_reason": f.duplicate_reason.map(|r| r.as_str()),
                 })).collect::<Vec<_>>(),
             }))
             .expect("serialize plan")
@@ -573,7 +574,15 @@ fn print_planned_job(job: &trove_core::import::ImportJob, json: bool) {
         job.artwork.len()
     );
     for file in &job.files {
-        println!("  {:>9}  {}", file.state.as_str(), file.path.display());
+        match file.duplicate_reason {
+            Some(reason) => println!(
+                "  {:>9}  {}  ({})",
+                file.state.as_str(),
+                file.path.display(),
+                reason.as_str()
+            ),
+            None => println!("  {:>9}  {}", file.state.as_str(), file.path.display()),
+        }
     }
     for art in &job.artwork {
         println!("  {:>9}  {}", "artwork", art.path.display());

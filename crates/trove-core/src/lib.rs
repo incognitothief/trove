@@ -181,6 +181,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -210,6 +211,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -227,6 +229,7 @@ mod tests {
             &track,
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
             &ImportOptions::default(),
+            None,
             None,
             None,
             None,
@@ -257,6 +260,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -277,6 +281,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut progress,
         )
         .unwrap();
@@ -287,6 +292,7 @@ mod tests {
             &album,
             crate::import::DEFAULT_AUDIO_EXTENSIONS,
             &ImportOptions::default(),
+            None,
             None,
             None,
             None,
@@ -314,6 +320,7 @@ mod tests {
             None,
             None,
             Some(&cache),
+            None,
             None,
             &mut progress,
         )
@@ -368,6 +375,7 @@ mod tests {
             None,
             None,
             Some(&cache),
+            None,
             None,
             &mut progress,
         )
@@ -436,6 +444,109 @@ mod tests {
         assert_eq!(
             results[0].library_relative_path.as_deref(),
             Some("Theo Parrish/Track.mp3")
+        );
+    }
+
+    #[test]
+    fn slug_and_size_fast_path_trusts_the_archive_over_the_files_actual_bytes() {
+        use crate::import::DuplicateReason;
+
+        // "Machine A" layout: real content, real hash.
+        let library_a = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library_a.path().join("Artist")).unwrap();
+        std::fs::write(
+            library_a.path().join("Artist/Track.mp3"),
+            b"original content",
+        )
+        .unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let mut trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+        trove.set_library_root(library_a.path()).unwrap();
+        let mut progress = NoopImportProgress;
+        let (_, committed) = trove
+            .import_run_full(library_a.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+        assert_eq!(committed, 1);
+        let original_sha = trove.query(&QuerySpec::new(), false).unwrap()[0].sha256.clone();
+
+        // "Machine B" (or a replacement drive): same relative structure and
+        // size at *Artist/Track.mp3*, but deliberately different bytes --
+        // proves the fast path trusts the archive match rather than
+        // silently re-reading and re-hashing, the same way the
+        // fingerprint-cache poison test proves C1's trust.
+        let library_b = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library_b.path().join("Artist")).unwrap();
+        assert_eq!(b"original content".len(), b"corrupted!!!!!!!".len());
+        std::fs::write(
+            library_b.path().join("Artist/Track.mp3"),
+            b"corrupted!!!!!!!",
+        )
+        .unwrap();
+
+        trove.set_library_root(library_b.path()).unwrap();
+        let job = trove
+            .import_plan(library_b.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+
+        assert_eq!(job.files.len(), 1);
+        assert_eq!(job.files[0].state, FileState::Duplicate);
+        assert_eq!(
+            job.files[0].duplicate_reason,
+            Some(DuplicateReason::SlugAndSize)
+        );
+        assert_eq!(
+            job.files[0].sha256, original_sha,
+            "must trust the archive's recorded hash, not re-hash library_b's actual (corrupted) bytes"
+        );
+    }
+
+    #[test]
+    fn slug_match_with_different_size_falls_through_to_a_real_hash() {
+        use crate::import::DuplicateReason;
+
+        let library_a = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library_a.path().join("Artist")).unwrap();
+        std::fs::write(library_a.path().join("Artist/Track.mp3"), b"short").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let mut trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+        trove.set_library_root(library_a.path()).unwrap();
+        let mut progress = NoopImportProgress;
+        trove
+            .import_run_full(library_a.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+
+        // Same relative path, genuinely different (and different-length)
+        // content -- a real re-rip or upgrade at the same catalog position,
+        // not a duplicate. The coarse filter must not make this call itself.
+        let library_b = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library_b.path().join("Artist")).unwrap();
+        std::fs::write(
+            library_b.path().join("Artist/Track.mp3"),
+            b"a much longer replacement file",
+        )
+        .unwrap();
+
+        trove.set_library_root(library_b.path()).unwrap();
+        let job = trove
+            .import_plan(library_b.path(), &ImportOptions::default(), false, &mut progress)
+            .unwrap();
+
+        assert_eq!(job.files.len(), 1);
+        assert_ne!(
+            job.files[0].duplicate_reason,
+            Some(DuplicateReason::SlugAndSize),
+            "a size mismatch must not be trusted as a slug+size match"
+        );
+        assert_eq!(
+            job.files[0].sha256,
+            crate::import::hash_bytes(b"a much longer replacement file"),
+            "must fall through to a real hash of library_b's actual content"
         );
     }
 
@@ -649,6 +760,7 @@ mod tests {
                     etag: None,
                     error: None,
                     attempts: 0,
+                    duplicate_reason: None,
                 },
             )
             .unwrap();
