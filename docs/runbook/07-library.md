@@ -2,14 +2,17 @@
 
 Manage the declared **library root** — the stable anchor cross-drive
 identity is computed relative to (ADR 007, Group D1). This is a growing
-command family: `root`, `backfill-slugs`, and `shape` exist today; the
-backfill Plan (ADR 007 Group E2) will live here too.
+command family: `root`, `backfill-slugs`, `shape`, and `plan` exist today;
+`plan status`/`plan claim` (ADR 007 Group E3/E3a) will live here too, once
+there's an event log to fold into per-chunk status.
 
 ```bash
-bin/trove library root                        # show the current root
-bin/trove library root --set <path>            # declare or change it
-bin/trove library backfill-slugs               # backfill existing entries
-bin/trove library shape [<path>]               # inspect structure (defaults to the declared root)
+bin/trove library root                                # show the current root
+bin/trove library root --set <path>                    # declare or change it
+bin/trove library backfill-slugs                       # backfill existing entries
+bin/trove library shape [<path>]                        # inspect structure (defaults to the declared root)
+bin/trove library plan create [<path>]                  # push a new Backfill Plan
+bin/trove library plan list [--library-root <path>]     # list known plans
 ```
 
 ## Why declare a library root at all
@@ -151,6 +154,97 @@ bin/trove --json library shape /Volumes/T7/music/library
   "max_depth": 2
 }
 ```
+
+## `trove library plan`
+
+A **Backfill Plan** turns a shape scan into durable, bucket-pushed chunk
+boundaries for coordinating a backfill — across sessions, or across
+multiple machines working the same library (ADR 007, Group E2). Chunk
+boundaries are folder-boundary: each chunk is one or more immediate
+subdirectories of the root. A Plan is immutable once created — it describes
+*scope*, not *progress* — so creating a new plan for a root you've already
+planned is always a fresh, independent plan, never an update to a prior
+one.
+
+```bash
+bin/trove library plan create /Volumes/T7/music/library
+```
+
+```text
+plan 8f14e45f-...  root=/Volumes/T7/music/library  212 chunk(s), 1 folder(s) per chunk
+     0  Kyle Hall                                              212 audio      6.8 GB
+     1  Theo Parrish                                           340 audio     11.2 GB
+   ...
+```
+
+Group N subdirectories into each chunk with `--chunk-folders`:
+
+```bash
+bin/trove library plan create /Volumes/T7/music/library --chunk-folders 5
+```
+
+Loose files sitting directly in the root (no subdirectory of their own)
+are folded into the first chunk rather than given a synthetic chunk of
+their own — shown as `+ loose root files` in that chunk's line.
+
+**Requirements and behavior:**
+
+- **Needs a live bucket connection** (unlike `root`/`backfill-slugs`/
+  `shape`) — a plan is pushed as soon as it's created, as a single
+  create-only write. It is never rewritten afterward.
+- Always mints a fresh `plan_id`. There's no "resume the plan for this
+  root" behavior — reference a prior plan explicitly by id instead of
+  relying on a root-matching heuristic.
+- Defaults to the declared library root when no path is given.
+- Each chunk carries the shape scan's rough audio/total file-count and
+  byte-size estimates — a cheap, `stat()`-only planning aid, not a
+  correctness guarantee.
+
+List known plans:
+
+```bash
+bin/trove library plan list
+bin/trove library plan list --library-root /Volumes/T7/music/library
+```
+
+```text
+8f14e45f-...  2026-08-16T12:00:00Z  212 chunk(s)  root=/Volumes/T7/music/library
+```
+
+Scans the bucket's `backfill-plans/` prefix directly — no separate index
+object, since these are small JSON documents and cheap to list.
+
+### JSON output
+
+```bash
+bin/trove --json library plan create /Volumes/T7/music/library
+```
+
+```json
+{
+  "plan_id": "8f14e45f-...",
+  "library_root": "/Volumes/T7/music/library",
+  "created_at": "2026-08-16T12:00:00Z",
+  "chunk_folders": 1,
+  "chunks": [
+    {
+      "chunk_id": "0",
+      "folders": ["Kyle Hall"],
+      "includes_root_files": false,
+      "estimated_audio_file_count": 212,
+      "estimated_audio_bytes": 7301234567,
+      "estimated_total_file_count": 214,
+      "estimated_total_bytes": 7305000000
+    }
+  ]
+}
+```
+
+**Not yet implemented:** `plan status` (per-chunk completed/claimed/
+untouched, folded from an event log) and `plan claim` (claim a chunk and
+drive the ordinary `import plan/run/commit` pipeline against it) — these
+need the append-only event log (ADR 007, Group E3) this Plan document is
+designed to sit underneath, not yet built.
 
 ## See also
 

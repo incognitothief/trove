@@ -551,6 +551,50 @@ mod tests {
     }
 
     #[test]
+    fn creates_and_pushes_a_backfill_plan_then_lists_it_back() {
+        let library = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(library.path().join("Artist A")).unwrap();
+        std::fs::create_dir_all(library.path().join("Artist B")).unwrap();
+        std::fs::write(library.path().join("Artist A/Track 1.mp3"), b"12345").unwrap();
+        std::fs::write(library.path().join("Artist B/Track 2.mp3"), b"123").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let mut trove =
+            Trove::open_with_store(test_config(), home.path(), Box::new(StubStore::new()))
+                .unwrap();
+
+        let plan = trove
+            .create_backfill_plan(library.path(), 1, &crate::library::ShapeOptions::default())
+            .unwrap();
+        assert_eq!(plan.library_root, library.path());
+        assert_eq!(plan.chunks.len(), 2);
+
+        // Re-listing re-reads from the store rather than trusting the
+        // in-memory value just returned, proving it actually landed in the
+        // bucket and round-trips through JSON correctly.
+        let listed = trove.list_backfill_plans(None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].plan_id, plan.plan_id);
+        assert_eq!(listed[0], plan);
+
+        let filtered_out = trove
+            .list_backfill_plans(Some(std::path::Path::new("/somewhere/else")))
+            .unwrap();
+        assert!(filtered_out.is_empty());
+
+        let filtered_in = trove.list_backfill_plans(Some(library.path())).unwrap();
+        assert_eq!(filtered_in.len(), 1);
+
+        // Never rewritten: a second plan for the same root is a distinct
+        // plan_id, not an update to the first.
+        let plan2 = trove
+            .create_backfill_plan(library.path(), 1, &crate::library::ShapeOptions::default())
+            .unwrap();
+        assert_ne!(plan.plan_id, plan2.plan_id);
+        assert_eq!(trove.list_backfill_plans(None).unwrap().len(), 2);
+    }
+
+    #[test]
     fn backfill_slugs_gives_already_archived_content_a_slug_without_touching_bytes() {
         let library = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(library.path().join("Theo Parrish")).unwrap();

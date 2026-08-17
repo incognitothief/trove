@@ -163,6 +163,70 @@ impl Trove {
         Ok(report)
     }
 
+    /// Scan a library root's shape and turn it into a durable Backfill Plan
+    /// (ADR 007, Group E2): chunk boundaries are folder-boundary, grouping
+    /// `chunk_folders` consecutive immediate subdirectories (in the shape
+    /// scan's alphabetical order) per chunk. Always mints a fresh `plan_id`
+    /// — there is no implicit "resume the plan for this root" behavior, by
+    /// design (silently reusing/mutating a prior plan based on a
+    /// root-matching heuristic is exactly the kind of implicit magic this
+    /// whole group exists to replace). The plan is pushed to the bucket
+    /// exactly once, as a create-only write — it is never rewritten after
+    /// creation, so unlike `schema-version.json` this needs no retry loop,
+    /// just a create-only guard against the practically-impossible case of a
+    /// `plan_id` collision.
+    pub fn create_backfill_plan(
+        &mut self,
+        root: &Path,
+        chunk_folders: u32,
+        shape_options: &crate::library::ShapeOptions,
+    ) -> Result<crate::library::BackfillPlan> {
+        let shape = crate::library::scan_library_shape(root, shape_options)?;
+        let plan_id = uuid::Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339();
+        let plan = crate::library::build_plan(plan_id, created_at, &shape, chunk_folders);
+        let bytes = serde_json::to_vec_pretty(&plan)?;
+        let key = self.paths.backfill_plan(&plan.plan_id);
+        match self.store.put_if_match(&key, None, &bytes)? {
+            PutOutcome::Written(_) => Ok(plan),
+            PutOutcome::Conflict { .. } => Err(crate::error::Error::store(format!(
+                "backfill plan {} already exists at {key} (plan_id collision — this should be \
+                 practically impossible; retry)",
+                plan.plan_id
+            ))),
+        }
+    }
+
+    /// List known Backfill Plans by scanning the `backfill-plans/` prefix
+    /// directly — these are small JSON documents, cheap to list and pull
+    /// individually, so no separate index object is needed the way the
+    /// archive index needs one. Optionally filtered to plans generated
+    /// against a specific `library_root` (an exact path match; a plan
+    /// doesn't know about D2's slug normalization, it just records whatever
+    /// root it was given).
+    pub fn list_backfill_plans(
+        &self,
+        library_root_filter: Option<&Path>,
+    ) -> Result<Vec<crate::library::BackfillPlan>> {
+        let keys = self.store.list(&self.paths.backfill_plans_prefix())?;
+        let mut plans = Vec::new();
+        for key in keys {
+            if !key.ends_with(".json") {
+                continue;
+            }
+            let bytes = self.store.get(&key)?;
+            let plan: crate::library::BackfillPlan = serde_json::from_slice(&bytes)?;
+            if let Some(filter) = library_root_filter {
+                if plan.library_root != filter {
+                    continue;
+                }
+            }
+            plans.push(plan);
+        }
+        plans.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(plans)
+    }
+
     /// Reconcile, then check every indexed entry actually has a
     /// correctly-sized object in the bucket. `deep` re-downloads and
     /// re-hashes every object instead of only checking presence/size — a

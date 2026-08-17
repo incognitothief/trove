@@ -5,9 +5,11 @@
 //! stable, explicitly-declared root these features need instead.
 
 pub mod backfill;
+pub mod plan;
 pub mod shape;
 pub mod slug;
 
 pub use backfill::{plan_slug_backfill, BackfillSlugsReport};
+pub use plan::{build_plan, BackfillPlan, PlanChunk};
 pub use shape::{scan_library_shape, LibraryShape, ShapeOptions, SubtreeShape};
 pub use slug::compute_slug;

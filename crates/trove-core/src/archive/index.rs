@@ -68,6 +68,17 @@ impl BucketPaths {
     pub fn artwork_manifest(&self) -> String {
         self.join(ARTWORK_MANIFEST_JSONL)
     }
+    /// Object key of an immutable Backfill Plan document (ADR 007, Group
+    /// E2). Never rewritten after creation — it describes *scope*, not
+    /// *progress*, so unlike `schema-version.json` it needs no CAS at all.
+    pub fn backfill_plan(&self, plan_id: &str) -> String {
+        self.join(&format!("backfill-plans/{plan_id}.json"))
+    }
+    /// Prefix under which every Backfill Plan document lives, for listing
+    /// known plans (`ObjectStore::list`).
+    pub fn backfill_plans_prefix(&self) -> String {
+        self.join("backfill-plans/")
+    }
 }
 
 /// Serialize entries to the JSONL interchange format.

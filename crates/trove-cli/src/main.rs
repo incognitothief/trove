@@ -83,6 +83,34 @@ enum LibraryCmd {
         #[arg(long)]
         include_dotfiles: bool,
     },
+    /// Backfill Plan management (ADR 007, Group E2) — durable, bucket-pushed
+    /// chunk boundaries generated from a shape scan.
+    #[command(subcommand)]
+    Plan(PlanCmd),
+}
+
+#[derive(Subcommand)]
+enum PlanCmd {
+    /// Scan a library root and push a new, immutable Backfill Plan. Always
+    /// mints a fresh plan id — there is no implicit "resume the plan for
+    /// this root," by design; reference a prior plan explicitly by id
+    /// instead of relying on a root-matching heuristic.
+    Create {
+        /// Root to scan. Defaults to the declared library root.
+        #[arg(value_name = "PATH")]
+        root: Option<String>,
+        /// How many immediate subdirectories to group into each chunk.
+        #[arg(long, default_value_t = 1)]
+        chunk_folders: u32,
+        #[arg(long)]
+        include_dotfiles: bool,
+    },
+    /// List known plans by scanning the bucket's `backfill-plans/` prefix.
+    List {
+        /// Only show plans generated against this exact library root.
+        #[arg(long, value_name = "PATH")]
+        library_root: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -363,8 +391,94 @@ fn library(cli: &Cli, cmd: &LibraryCmd) -> Result<()> {
             .with_context(|| format!("scanning library shape at {}", root.display()))?;
             print_library_shape(&shape, cli.json);
         }
+        // Both need a live bucket: creating pushes a new object, listing
+        // reads the backfill-plans/ prefix.
+        LibraryCmd::Plan(PlanCmd::Create {
+            root,
+            chunk_folders,
+            include_dotfiles,
+        }) => {
+            let root = match root {
+                Some(path) => std::path::PathBuf::from(path),
+                None => runtime::load_config()?
+                    .library
+                    .root
+                    .context("no path given and no library root declared — pass a path or run `trove library root --set <path>`")?,
+            };
+            let mut trove = runtime::open_trove()?;
+            let plan = trove
+                .create_backfill_plan(
+                    &root,
+                    *chunk_folders,
+                    &trove_core::library::ShapeOptions {
+                        include_dotfiles: *include_dotfiles,
+                    },
+                )
+                .with_context(|| format!("creating backfill plan for {}", root.display()))?;
+            print_backfill_plan(&plan, cli.json);
+        }
+        LibraryCmd::Plan(PlanCmd::List { library_root }) => {
+            let trove = runtime::open_trove()?;
+            let filter = library_root.as_ref().map(std::path::PathBuf::from);
+            let plans = trove
+                .list_backfill_plans(filter.as_deref())
+                .context("listing backfill plans")?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plans).expect("serialize plans")
+                );
+            } else if plans.is_empty() {
+                println!("no backfill plans found");
+            } else {
+                for plan in &plans {
+                    println!(
+                        "{}  {}  {} chunk(s)  root={}",
+                        plan.plan_id,
+                        plan.created_at,
+                        plan.chunks.len(),
+                        plan.library_root.display(),
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn print_backfill_plan(plan: &trove_core::library::BackfillPlan, json: bool) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(plan).expect("serialize plan")
+        );
+        return;
+    }
+    println!(
+        "plan {}  root={}  {} chunk(s), {} folder(s) per chunk",
+        plan.plan_id,
+        plan.library_root.display(),
+        plan.chunks.len(),
+        plan.chunk_folders,
+    );
+    for chunk in &plan.chunks {
+        let label = if chunk.folders.is_empty() {
+            "(loose root files)".to_string()
+        } else {
+            let mut label = chunk.folders.join(", ");
+            if chunk.includes_root_files {
+                label.push_str(" + loose root files");
+            }
+            label
+        };
+        println!(
+            "  {:>4}  {:<50}  {:>6} audio  {:>10}",
+            chunk.chunk_id,
+            label,
+            chunk.estimated_audio_file_count,
+            format_bytes(chunk.estimated_audio_bytes),
+        );
+    }
 }
 
 fn print_library_shape(shape: &trove_core::library::LibraryShape, json: bool) {
